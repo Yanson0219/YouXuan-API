@@ -19,14 +19,14 @@
 
 ---
 
-## 0) 只用 Workers，拒用 Pages
+## （0) 只用 Workers，拒用 Pages
 
 > **不要用 Cloudflare Pages**，否则 API 无法即时更新。  
 > 使用 **Cloudflare Workers** 并 **连接 GitHub**，才能做到 **push 即生效**。
 
 ---
 
-## 1) 快速开始（Workers + GitHub）
+## （1) 快速开始（Workers + GitHub）
 
 1. **Fork** 本仓库（或将 `workers.js` 放入你的仓库）。
 2. Cloudflare 控制台 → **Workers & Pages → Create Worker**（先建一个空 Worker）。
@@ -50,7 +50,7 @@
 
 ---
 
-## 2) 支持的测速来源
+## （2) 支持的测速来源
 
 把导出的 **CSV/TXT** 直接拖进页面或粘贴文本即可，典型来源：
 
@@ -64,7 +64,7 @@
 
 ---
 
-## 3) 使用流程（UI）
+## （3) 使用流程（UI）
 
 1. 访问 `https://你的域名/`  
 2. **上传测速文件**（可多次追加）或**粘贴文本**  
@@ -79,7 +79,7 @@
 
 ---
 
-## 4) API 速查
+## （4) API 速查
 
 GET / # 内置 UI（桌面/移动/深色）
 GET /api/status # { ok, kvBound, tokenSet }
@@ -104,7 +104,7 @@ curl -X POST https://你的域名/api/preview \
 curl -X POST "https://你的域名/api/publish?token=你的TOKEN" \
   -H "content-type: text/plain; charset=utf-8" \
   --data-binary @output.txt
-（5) 选项说明
+##（5) 选项说明
 
 地区显示
 
@@ -138,7 +138,7 @@ curl -X POST "https://你的域名/api/publish?token=你的TOKEN" \
 
 深色模式在暗底使用更高对比（黑底白字）
 
-（6) 搭配其它项目
+##（6) 搭配其它项目
 
 edgetunnel：https://github.com/cmliu/edgetunnel
 
@@ -154,7 +154,7 @@ CFnat（Windows GUI）：https://github.com/cmliu/CFnat-Windows-GUI
 
 CloudflareSpeedTest：https://github.com/XIU2/CloudflareSpeedTest
 
-（7) 常见问题
+##（7) 常见问题
 
 为什么坚决不用 Pages？ Pages 的构建与 Functions 延迟导致接口不能“即时更新”。要 push 即生效 → 用 Workers + GitHub。
 
@@ -162,7 +162,7 @@ CloudflareSpeedTest：https://github.com/XIU2/CloudflareSpeedTest
 
 地区没匹配？ 保留原字段（例如 DUS/OTP/WAW 等 IATA 已补充常用映射，缺失也会原样输出）。
 
-8) 更新要点（2025-10-29）
+##（8) 更新要点（2025-10-29）
 
 地区去重与 A2/中文双模式；仅国家 / 国家+城市 / 国家+州省 / 仅城市
 
@@ -176,6 +176,6 @@ CloudflareSpeedTest：https://github.com/XIU2/CloudflareSpeedTest
 
 订阅地址不在前端显示（仅服务端验证 TOKEN）
 
-（9) 许可
+##（9) 许可
 
 MIT License。使用本项目即表示你将自担使用风险与合规责任。
