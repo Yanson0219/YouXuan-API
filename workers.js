@@ -1,12 +1,5 @@
 // worker.js
-// YouXuan-API — Cloudflare Worker (2025-10-29 r9 + speedMode patch r10)
-// - Glass UI, server-side bg/logo prefs (cross-device) via KV /api/prefs
-// - Quotas in own modal with help; latency-first sort with country grouping
-// - Region naming via Intl.DisplayNames zh-CN (fallback map + A2)
-// - Domain remark only for domains; IP needs port (gate)
-// - 3 region modes: country | city | country_city
-// - Safer IPv6 check (no giant regex)
-// - Added: speedMode (0=off,1=number,2=number+MB/s) and robust unit conversion to MB/s
+// YouXuan-API — Cloudflare Worker (修正版)
 
 const REPO = "https://github.com/Yanson0219/YouXuan-API";
 
@@ -104,6 +97,7 @@ export default {
         const nodeSuffix   = (form.get("nodeSuffix") || "").toString();
         const digits       = clampInt(toPosInt(form.get("digits"), 2), 0, 6);
         const speedMode    = clampInt(toPosInt(form.get("speedMode"), 2), 0, 2); // 0=off,1=number,2=number+unit
+        const minSpeed     = parseFloat(form.get("minSpeed")) || 0; // 最小速度过滤
 
         const quotaV4      = toPosInt(form.get("quotaV4"), 0);
         const quotaV6      = toPosInt(form.get("quotaV6"), 0);
@@ -111,6 +105,7 @@ export default {
         const quotaTopN    = toPosInt(form.get("quotaTopN"), 0);   // 全局前 N
         const maxLinesReq  = toPosInt(form.get("maxLines"), 0);
         const preferLowLat = (form.get("preferLowLat")==="on");
+        const saveMode     = (form.get("saveMode") || "overwrite").toString(); // 保存模式
 
         const outPortSel   = (form.get("outPortSel") || "").toString().trim();
         const outPortCus   = toPosInt(form.get("outPortCus"), 0);
@@ -142,7 +137,7 @@ export default {
           ipv4_count: 0, ipv6_count: 0, domain_count: 0,
           with_speed_count: 0, quota_v4: quotaV4, quota_v6: quotaV6,
           limit_maxlines: maxLinesReq, skipped_quota: 0, total_after_quota: 0,
-          output_count: 0, skipped_count: 0
+          output_count: 0, skipped_count: 0, skipped_speed: 0, skipped_latency: 0
         };
 
         const STOPWORDS = new Set(["ip地址","ip","地址","host","domain","域名","ip address","hostname","server"]);
@@ -205,7 +200,8 @@ export default {
           const label = formatRegion3({ a2, sub, cityZh, raw:(regRaw||"") }, regionLang, regionDetail);
 
           // speed / latency
-          const spStr = formatSpeedRaw(col(speedIdx), speedMode, digits); // <<< patched
+          const spStr = formatSpeedRaw(col(speedIdx), speedMode, digits);
+          const speedMB = parseSpeedToMBps(col(speedIdx)); // 获取速度数值用于过滤
           if (spStr) stats.with_speed_count++;
 
           let lat = Number.POSITIVE_INFINITY;
@@ -213,12 +209,28 @@ export default {
             const m = col(latIdx).match(/-?\d+(?:\.\d+)?/); if (m) { const v=parseFloat(m[0]); if (Number.isFinite(v)) lat=v; }
           }
 
+          // 速度过滤
+          if (minSpeed > 0 && (!Number.isFinite(speedMB) || speedMB < minSpeed)) {
+            stats.skipped_speed++;
+            continue;
+          }
+
           // counts
           if (v4) stats.ipv4_count++; else if (v6) stats.ipv6_count++; else stats.domain_count++;
 
           // build address + remark
-          let addrDisp = isDomain ? host : (v4 ? host : "["+host+"]") + (finalPort? (":" + finalPort) : "");
-          if (isDomain) { addrDisp = host; } // domain never with port
+          let addrDisp = "";
+          if (isDomain) {
+            addrDisp = host; // domain never with port
+          } else {
+            // 对于IP地址，确保格式正确
+            if (v4) {
+              addrDisp = host + (finalPort ? ":" + finalPort : "");
+            } else {
+              // IPv6 地址用中括号括起来
+              addrDisp = "[" + host + "]" + (finalPort ? ":" + finalPort : "");
+            }
+          }
 
           const flag = (decorateFlg && a2) ? flagFromA2(a2) : "";
           let remark = "";
@@ -235,7 +247,10 @@ export default {
             v4, v6, isDomain,
             lat,
             addr: addrDisp,
-            line: addrDisp + "#" + remark
+            host: host,
+            port: finalPort,
+            line: addrDisp + "#" + remark,
+            speedMB // 保存速度数值用于后续处理
           });
         }
 
@@ -286,10 +301,18 @@ export default {
         const MAX_PREV = 20000;
         const preview  = applied.slice(0, MAX_PREV).map(r=>r.line);
 
-        return J({ ok:true, lines: preview, count: applied.length, headers, stats, truncated: applied.length > MAX_PREV });
+        return J({ 
+          ok:true, 
+          lines: preview, 
+          count: applied.length, 
+          headers, 
+          stats, 
+          truncated: applied.length > MAX_PREV,
+          saveMode
+        });
       }
 
-      // publish
+      // publish - 修正版，直接处理纯节点数据
       if (request.method === "POST" && path === "/api/publish") {
         if (!env.KV)    return J({ ok:false, error:"KV not bound" }, 500);
         if (!env.TOKEN) return J({ ok:false, error:"TOKEN not configured" }, 500);
@@ -298,24 +321,59 @@ export default {
         let token = q.get("token") || request.headers.get("x-token");
         const ct = request.headers.get("content-type") || "";
         let content = "";
+        let saveMode = "overwrite";
 
-        if (!token && ct.includes("application/json")) {
-          try { const jj=await request.json(); token=(jj.token||"").toString(); content=(jj.content||"").toString(); } catch(_){}
+        // 处理 JSON 格式的请求
+        if (ct.includes("application/json")) {
+          try { 
+            const jsonData = await request.json();
+            token = (jsonData.token || token || "").toString();
+            content = (jsonData.content || "").toString();
+            saveMode = (jsonData.saveMode || "overwrite").toString();
+          } catch(e) {
+            return J({ ok:false, error:"Invalid JSON format" }, 400);
+          }
         }
-        if (!token && ct.includes("multipart/form-data")) {
-          const f=await request.formData(); token=(f.get("token")||"").toString(); content=(f.get("content")||"").toString();
+        // 处理 multipart/form-data 格式的请求
+        else if (ct.includes("multipart/form-data")) {
+          const formData = await request.formData();
+          token = (formData.get("token") || token || "").toString();
+          content = (formData.get("content") || "").toString();
+          saveMode = (formData.get("saveMode") || "overwrite").toString();
         }
-        if (!token) { if (ct && !content) content = await request.text(); }
+        // 处理纯文本格式的请求
+        else {
+          content = await request.text();
+          // 清理 multipart 格式，提取纯节点数据
+          content = cleanMultipartContent(content);
+        }
 
         if (token !== env.TOKEN) return J({ ok:false, error:"Unauthorized (bad token)" }, 401);
-        if (!content) { content = await request.text(); if (!content) return J({ ok:false, error:"content is empty" }, 400); }
+        
+        // 最终清理内容（确保没有格式边界）
+        if (content.includes("------WebKitFormBoundary")) {
+          content = cleanMultipartContent(content);
+        }
+        
+        if (!content) return J({ ok:false, error:"content is empty" }, 400);
 
         const key = env.TOKEN;
-        content = content.split("\n").map(s => (s||"").replace(/\s+/g,"")).join("\n");
+        // 确保内容是一行一个，格式正确
+        content = content.split("\n")
+          .map(line => line.trim())
+          .filter(line => line && !line.includes("Content-Disposition") && !line.includes("WebKitFormBoundary"))
+          .join("\n");
+        
+        // 处理保存模式
+        if (saveMode === "append") {
+          const existing = await env.KV.get("sub:" + key) || "";
+          content = existing + (existing ? "\n" : "") + content;
+        }
+
         await env.KV.put("sub:" + key, content);
-        const meta = { updated: Date.now(), count: content ? content.split("\n").length : 0 };
+        const meta = { updated: Date.now(), count: content ? content.split("\n").length : 0, saveMode };
         await env.KV.put("meta:" + key, JSON.stringify(meta));
-        return J({ ok:true, key, count: meta.count, updated: meta.updated });
+        return J({ ok:true, key, count: meta.count, updated: meta.updated, saveMode });
       }
 
       return new Response("Not Found", { status: 404 });
@@ -356,59 +414,112 @@ function parseCSV(text, d){
 
 /* ---------------- region/city code ---------------- */
 
-// IATA -> A2/Sub/CityZH (extended core, add HEL)
+// IATA -> A2/Sub/CityZH (extended core)
 const IATA_TO_A2 = {
-  LAX:"US", SJC:"US", SFO:"US", SEA:"US", DEN:"US", EWR:"US", JFK:"US", IAD:"US", DFW:"US",
-  LHR:"GB", MAN:"GB",
-  HKG:"HK",
-  NRT:"JP", HND:"JP", KIX:"JP", ITM:"JP",
-  CDG:"FR", ORY:"FR", FRA:"DE", MUC:"DE", DUS:"DE",
-  YYZ:"CA", YVR:"CA", YUL:"CA",
-  AMS:"NL", BRU:"BE", DUB:"IE", WAW:"PL", OTP:"RO",
-  SIN:"SG", ICN:"KR", ZRH:"CH", BKK:"TH", DXB:"AE",
-  HEL:"FI"
-};
-const IATA_TO_SUB = { LAX:"CA", SJC:"CA", SFO:"CA", SEA:"WA", DEN:"CO", EWR:"NJ", JFK:"NY", IAD:"VA", DFW:"TX", YYZ:"ON" };
-const IATA_TO_CITY_ZH = {
-  LAX:"洛杉矶", SJC:"圣何塞", SFO:"旧金山", SEA:"西雅图", DEN:"丹佛", EWR:"新泽西", JFK:"纽约", IAD:"华盛顿", DFW:"达拉斯",
-  LHR:"伦敦", MAN:"曼彻斯特", HKG:"香港",
-  NRT:"东京", HND:"东京", KIX:"大阪", ITM:"大阪",
-  CDG:"巴黎", ORY:"巴黎", FRA:"法兰克福", MUC:"慕尼黑", DUS:"杜塞尔多夫",
-  YYZ:"多伦多", YVR:"温哥华", YUL:"蒙特利尔",
-  AMS:"阿姆斯特丹", BRU:"布鲁塞尔", DUB:"都柏林", WAW:"华沙", OTP:"布加勒斯特",
-  SIN:"新加坡", ICN:"首尔", ZRH:"苏黎世", BKK:"曼谷", DXB:"迪拜",
-  HEL:"赫尔辛基"
+  LAX:"US", SJC:"US", SFO:"US", SEA:"US", DEN:"US", EWR:"US", JFK:"US", IAD:"US", DFW:"US", ORD:"US", ATL:"US", MIA:"US", BOS:"US",
+  LHR:"GB", MAN:"GB", LGW:"GB", EDI:"GB", BHX:"GB",
+  HKG:"HK", MFM:"MO", TPE:"TW", KHH:"TW", TSA:"TW", FOC:"TW", KNH:"TW",
+  NRT:"JP", HND:"JP", KIX:"JP", ITM:"JP", FUK:"JP", CTS:"JP", OKA:"JP",
+  CDG:"FR", ORY:"FR", FRA:"DE", MUC:"DE", DUS:"DE", TXL:"DE", HAM:"DE",
+  YYZ:"CA", YVR:"CA", YUL:"CA", YYC:"CA", YEG:"CA",
+  AMS:"NL", BRU:"BE", DUB:"IE", WAW:"PL", OTP:"RO", VIE:"AT", PRG:"CZ",
+  SIN:"SG", ICN:"KR", ZZH:"CH", BKK:"TH", DXB:"AE", AUH:"AE", DOH:"QA",
+  HEL:"FI", ARN:"SE", OSL:"NO", CPH:"DK", MAD:"ES", BCN:"ES", LIS:"PT",
+  SYD:"AU", MEL:"AU", BNE:"AU", PER:"AU", AKL:"NZ", CHC:"NZ",
+  BOM:"IN", DEL:"IN", MAA:"IN", BLR:"IN", KUL:"MY", BWN:"BN", MNL:"PH",
+  SGN:"VN", HAN:"VN", BKK:"TH", DMK:"TH", CNX:"TH", HKT:"TH"
 };
 
-// 中文国名补充（主力），优先使用 Intl.DisplayNames
+const IATA_TO_SUB = { 
+  LAX:"CA", SJC:"CA", SFO:"CA", SEA:"WA", DEN:"CO", EWR:"NJ", JFK:"NY", IAD:"VA", DFW:"TX", 
+  ORD:"IL", ATL:"GA", MIA:"FL", BOS:"MA", YYZ:"ON", YVR:"BC", YUL:"QC", YYC:"AB", YEG:"AB"
+};
+
+const IATA_TO_CITY_ZH = {
+  LAX:"洛杉矶", SJC:"圣何塞", SFO:"旧金山", SEA:"西雅图", DEN:"丹佛", EWR:"新泽西", JFK:"纽约", IAD:"华盛顿", DFW:"达拉斯",
+  ORD:"芝加哥", ATL:"亚特兰大", MIA:"迈阿密", BOS:"波士顿",
+  LHR:"伦敦", MAN:"曼彻斯特", LGW:"伦敦", EDI:"爱丁堡", BHX:"伯明翰",
+  HKG:"香港", MFM:"澳门", TPE:"台北", KHH:"高雄", TSA:"台北", FOC:"福州", KNH:"金门",
+  NRT:"东京", HND:"东京", KIX:"大阪", ITM:"大阪", FUK:"福冈", CTS:"札幌", OKA:"冲绳",
+  CDG:"巴黎", ORY:"巴黎", FRA:"法兰克福", MUC:"慕尼黑", DUS:"杜塞尔多夫", TXL:"柏林", HAM:"汉堡",
+  YYZ:"多伦多", YVR:"温哥华", YUL:"蒙特利尔", YYC:"卡尔加里", YEG:"埃德蒙顿",
+  AMS:"阿姆斯特丹", BRU:"布鲁塞尔", DUB:"都柏林", WAW:"华沙", OTP:"布加勒斯特", VIE:"维也纳", PRG:"布拉格",
+  SIN:"新加坡", ICN:"首尔", ZZH:"苏黎世", BKK:"曼谷", DXB:"迪拜", AUH:"阿布扎比", DOH:"多哈",
+  HEL:"赫尔辛基", ARN:"斯德哥尔摩", OSL:"奥斯陆", CPH:"哥本哈根", MAD:"马德里", BCN:"巴塞罗那", LIS:"里斯本",
+  SYD:"悉尼", MEL:"墨尔本", BNE:"布里斯班", PER:"珀斯", AKL:"奥克兰", CHC:"基督城",
+  BOM:"孟买", DEL:"德里", MAA:"金奈", BLR:"班加罗尔", KUL:"吉隆坡", BWN:"斯里巴加湾市", MNL:"马尼拉",
+  SGN:"胡志明市", HAN:"河内", DMK:"曼谷", CNX:"清迈", HKT:"普吉岛"
+};
+
+// 中文国名补充（完整版）
 const COUNTRY_ZH = {
   CN:"中国", HK:"香港", MO:"澳门", TW:"台湾",
   US:"美国", GB:"英国", DE:"德国", FR:"法国", NL:"荷兰", BE:"比利时", IE:"爱尔兰", CA:"加拿大", JP:"日本", KR:"韩国", SG:"新加坡",
   IN:"印度", AE:"阿联酋", TR:"土耳其", RU:"俄罗斯", AU:"澳大利亚", ES:"西班牙", IT:"意大利", BR:"巴西", MX:"墨西哥", ZA:"南非",
   CH:"瑞士", TH:"泰国", PL:"波兰", RO:"罗马尼亚", SE:"瑞典", NO:"挪威", DK:"丹麦", FI:"芬兰", PT:"葡萄牙", GR:"希腊",
   AT:"奥地利", CZ:"捷克", HU:"匈牙利", UA:"乌克兰", IL:"以色列", SA:"沙特阿拉伯", EG:"埃及", NG:"尼日利亚", CL:"智利", CO:"哥伦比亚",
-  AR:"阿根廷", PE:"秘鲁", NZ:"新西兰"
+  AR:"阿根廷", PE:"秘鲁", NZ:"新西兰", MY:"马来西亚", ID:"印度尼西亚", VN:"越南", PH:"菲律宾", BD:"孟加拉国", PK:"巴基斯坦",
+  LK:"斯里兰卡", NP:"尼泊尔", MM:"缅甸", KH:"柬埔寨", LA:"老挝", BN:"文莱", AF:"阿富汗", IQ:"伊拉克", IR:"伊朗", SY:"叙利亚",
+  JO:"约旦", LB:"黎巴嫩", OM:"阿曼", YE:"也门", QA:"卡塔尔", KW:"科威特", BH:"巴林", CY:"塞浦路斯", MT:"马耳他",
+  IS:"冰岛", EE:"爱沙尼亚", LV:"拉脱维亚", LT:"立陶宛", BY:"白俄罗斯", MD:"摩尔多瓦", GE:"格鲁吉亚", AM:"亚美尼亚", AZ:"阿塞拜疆",
+  KZ:"哈萨克斯坦", UZ:"乌兹别克斯坦", TM:"土库曼斯坦", KG:"吉尔吉斯斯坦", TJ:"塔吉克斯坦", MN:"蒙古", KP:"朝鲜", UY:"乌拉圭",
+  PY:"巴拉圭", BO:"玻利维亚", EC:"厄瓜多尔", VE:"委内瑞拉", CR:"哥斯达黎加", PA:"巴拿马", CU:"古巴", DO:"多米尼加", JM:"牙买加",
+  HT:"海地", BS:"巴哈马", TT:"特立尼达和多巴哥", BB:"巴巴多斯", GD:"格林纳达", LC:"圣卢西亚", VC:"圣文森特", KN:"圣基茨和尼维斯",
+  AG:"安提瓜和巴布达", DM:"多米尼克", SR:"苏里南", GF:"法属圭亚那", GY:"圭亚那", FK:"福克兰群岛", GS:"南乔治亚岛",
+  GL:"格陵兰", BM:"百慕大", KY:"开曼群岛", TC:"特克斯和凯科斯群岛", VG:"英属维尔京群岛", AI:"安圭拉", MS:"蒙特塞拉特",
+  AW:"阿鲁巴", CW:"库拉索", SX:"圣马丁", BQ:"博奈尔", MF:"法属圣马丁", BL:"圣巴泰勒米", GP:"瓜德罗普", MQ:"马提尼克",
+  YT:"马约特", RE:"留尼汪", SC:"塞舌尔", MU:"毛里求斯", KM:"科摩罗", MV:"马尔代夫", MG:"马达加斯加", ZW:"津巴布韦",
+  ZM:"赞比亚", MW:"马拉维", TZ:"坦桑尼亚", KE:"肯尼亚", UG:"乌干达", RW:"卢旺达", BI:"布隆迪", ET:"埃塞俄比亚",
+  ER:"厄立特里亚", DJ:"吉布提", SO:"索马里", SD:"苏丹", SS:"南苏丹", TD:"乍得", CF:"中非", CM:"喀麦隆", GA:"加蓬",
+  CG:"刚果", CD:"刚果金", AO:"安哥拉", NA:"纳米比亚", BW:"博茨瓦纳", LS:"莱索托", SZ:"斯威士兰", MZ:"莫桑比克",
+  MG:"马达加斯加", KM:"科摩罗", YT:"马约特", RE:"留尼汪", MU:"毛里求斯", SC:"塞舌尔"
 };
-// A3->A2 (常见)
-const A3_TO_A2 = { HKG:"HK", MAC:"MO", TWN:"TW", CHN:"CN", USA:"US", JPN:"JP", KOR:"KR", SGP:"SG", MYS:"MY", VNM:"VN", THA:"TH", PHL:"PH", IDN:"ID", IND:"IN",
+
+// A3->A2 (完整版)
+const A3_TO_A2 = { 
+  HKG:"HK", MAC:"MO", TWN:"TW", CHN:"CN", USA:"US", JPN:"JP", KOR:"KR", SGP:"SG", MYS:"MY", VNM:"VN", THA:"TH", PHL:"PH", IDN:"ID", IND:"IN",
   GBR:"GB", FRA:"FR", DEU:"DE", ITA:"IT", ESP:"ES", RUS:"RU", CAN:"CA", AUS:"AU", NLD:"NL", BRA:"BR", ARG:"AR", MEX:"MX", TUR:"TR",
   ARE:"AE", ISR:"IL", ZAF:"ZA", SWE:"SE", NOR:"NO", DNK:"DK", FIN:"FI", POL:"PL", CZE:"CZ", AUT:"AT", CHE:"CH", BEL:"BE", IRL:"IE",
-  PRT:"PT", GRC:"GR", HUN:"HU", ROU:"RO", UKR:"UA", NZL:"NZ", COL:"CO", PER:"PE", CHL:"CL", SAU:"SA", EGY:"EG", NGA:"NG" };
+  PRT:"PT", GRC:"GR", HUN:"HU", ROU:"RO", UKR:"UA", NZL:"NZ", COL:"CO", PER:"PE", CHL:"CL", SAU:"SA", EGY:"EG", NGA:"NG",
+  PAK:"PK", BGD:"BD", LKA:"LK", NPL:"NP", MMR:"MM", KHM:"KH", LAO:"LA", BRN:"BN", AFG:"AF", IRQ:"IQ", IRN:"IR", SYR:"SY",
+  JOR:"JO", LBN:"LB", OMN:"OM", YEM:"YE", QAT:"QA", KWT:"KW", BHR:"BH", CYP:"CY", MLT:"MT", ISL:"IS", EST:"EE", LVA:"LV",
+  LTU:"LT", BLR:"BY", MDA:"MD", GEO:"GE", ARM:"AM", AZE:"AZ", KAZ:"KZ", UZB:"UZ", TKM:"TM", KGZ:"KG", TJK:"TJ", MNG:"MN",
+  PRK:"KP", URY:"UY", PRY:"PY", BOL:"BO", ECU:"EC", VEN:"VE", CRI:"CR", PAN:"PA", CUB:"CU", DOM:"DO", JAM:"JM", HTI:"HT",
+  BHS:"BS", TTO:"TT", BRB:"BB", GRD:"GD", LCA:"LC", VCT:"VC", KNA:"KN", ATG:"AG", DMA:"DM", SUR:"SR", GUF:"GF", GUY:"GY",
+  FLK:"FK", SGS:"GS", GRL:"GL", BMU:"BM", CYM:"KY", TCA:"TC", VGB:"VG", AIA:"AI", MSR:"MS", ABW:"AW", CUW:"CW", SXM:"SX",
+  BES:"BQ", MAF:"MF", BLM:"BL", GLP:"GP", MTQ:"MQ", MYT:"YT", REU:"RE", SYC:"SC", MUS:"MU", COM:"KM", MDV:"MV", MDG:"MG",
+  ZWE:"ZW", ZMB:"ZM", MWI:"MW", TZA:"TZ", KEN:"KE", UGA:"UG", RWA:"RW", BDI:"BI", ETH:"ET", ERI:"ER", DJI:"DJ", SOM:"SO",
+  SDN:"SD", SSD:"SS", TCD:"TD", CAF:"CF", CMR:"CM", GAB:"GA", COG:"CG", COD:"CD", AGO:"AO", NAM:"NA", BWA:"BW", LSO:"LS",
+  SWZ:"SZ", MOZ:"MZ"
+};
 
 // 英文城市关键词 -> 中文
 const CITY_EN_TO_ZH = {
   "TOKYO":"东京","OSAKA":"大阪","SINGAPORE":"新加坡","SEOUL":"首尔","LONDON":"伦敦","FRANKFURT":"法兰克福","PARIS":"巴黎",
-  "AMSTERDAM":"阿姆斯特丹","BRUSSELS":"布鲁塞尔","DUBLIN":"都柏林","MANCHESTER":"曼彻斯特","DUBAI":"迪拜",
+  "AMSTERDAM":"阿姆斯特丹","BRUSSELS":"布鲁塞尔","DUBLIN":"都柏林","MANCHESTER":"曼彻斯特","DUBAI":"迪拜","ABUDHABI":"阿布扎比",
   "LOS ANGELES":"洛杉矶","LOSANGELES":"洛杉矶","SEATTLE":"西雅图","SAN FRANCISCO":"旧金山","SANFRANCISCO":"旧金山","SAN JOSE":"圣何塞","SANJOSE":"圣何塞",
-  "NEW YORK":"纽约","NEWYORK":"纽约","NEW JERSEY":"新泽西","JERSEY":"新泽西","WASHINGTON":"华盛顿","DALLAS":"达拉斯",
-  "TORONTO":"多伦多","VANCOUVER":"温哥华","MONTREAL":"蒙特利尔","WARSAW":"华沙","BUCHAREST":"布加勒斯特","ZURICH":"苏黎世","BANGKOK":"曼谷",
-  "HONG KONG":"香港","HONGKONG":"香港","BEIJING":"北京","SHANGHAI":"上海","SHENZHEN":"深圳","GUANGZHOU":"广州","MUMBAI":"孟买","CHENNAI":"金奈",
-  "ASHBURN":"阿什本","HELSINKI":"赫尔辛基","DUSSELDORF":"杜塞尔多夫","DÜSSELDORF":"杜塞尔多夫","FRANKFURT AM MAIN":"法兰克福"
+  "NEW YORK":"纽约","NEWYORK":"纽约","NEW JERSEY":"新泽西","JERSEY":"新泽西","WASHINGTON":"华盛顿","DALLAS":"达拉斯","CHICAGO":"芝加哥",
+  "ATLANTA":"亚特兰大","MIAMI":"迈阿密","BOSTON":"波士顿","HOUSTON":"休斯顿","PHOENIX":"凤凰城","PHILADELPHIA":"费城",
+  "TORONTO":"多伦多","VANCOUVER":"温哥华","MONTREAL":"蒙特利尔","CALGARY":"卡尔加里","EDMONTON":"埃德蒙顿",
+  "WARSAW":"华沙","BUCHAREST":"布加勒斯特","ZURICH":"苏黎世","BANGKOK":"曼谷","VIENNA":"维也纳","PRAGUE":"布拉格",
+  "HONG KONG":"香港","HONGKONG":"香港","BEIJING":"北京","SHANGHAI":"上海","SHENZHEN":"深圳","GUANGZHOU":"广州","TIANJIN":"天津",
+  "CHONGQING":"重庆","CHENGDU":"成都","WUHAN":"武汉","NANJING":"南京","HANGZHOU":"杭州","XIAMEN":"厦门","QINGDAO":"青岛",
+  "DALIAN":"大连","NINGBO":"宁波","FOSHAN":"佛山","SUZHOU":"苏州","WUXI":"无锡","CHANGZHOU":"常州","ZHUHAI":"珠海",
+  "MUMBAI":"孟买","CHENNAI":"金奈","BANGALORE":"班加罗尔","HYDERABAD":"海得拉巴","KOLKATA":"加尔各答","NEW DELHI":"新德里",
+  "ASHBURN":"阿什本","HELSINKI":"赫尔辛基","DUSSELDORF":"杜塞尔多夫","DÜSSELDORF":"杜塞尔多夫","FRANKFURT AM MAIN":"法兰克福",
+  "STOCKHOLM":"斯德哥尔摩","OSLO":"奥斯陆","COPENHAGEN":"哥本哈根","MADRID":"马德里","BARCELONA":"巴塞罗那","LISBON":"里斯本",
+  "ROME":"罗马","MILAN":"米兰","SYDNEY":"悉尼","MELBOURNE":"墨尔本","BRISBANE":"布里斯班","PERTH":"珀斯","AUCKLAND":"奥克兰",
+  "WELLINGTON":"惠灵顿","TAIPEI":"台北","KAOHSIUNG":"高雄","TAINAN":"台南","TAICHUNG":"台中","KEELUNG":"基隆"
 };
+
 const CITY_ZH_LIST = [
-  "东京","大阪","新加坡","首尔","伦敦","法兰克福","巴黎","阿姆斯特丹","布鲁塞尔","都柏林","曼彻斯特","迪拜",
-  "洛杉矶","西雅图","旧金山","圣何塞","纽约","新泽西","华盛顿","达拉斯","苏黎世","曼谷","香港","北京","上海","深圳","广州",
-  "多伦多","温哥华","蒙特利尔","华沙","布加勒斯特","孟买","金奈","阿什本","赫尔辛基","杜塞尔多夫"
+  "东京","大阪","新加坡","首尔","伦敦","法兰克福","巴黎","阿姆斯特丹","布鲁塞尔","都柏林","曼彻斯特","迪拜","阿布扎比",
+  "洛杉矶","西雅图","旧金山","圣何塞","纽约","新泽西","华盛顿","达拉斯","芝加哥","亚特兰大","迈阿密","波士顿","休斯顿",
+  "凤凰城","费城","苏黎世","曼谷","维也纳","布拉格","香港","北京","上海","深圳","广州","天津","重庆","成都","武汉","南京",
+  "杭州","厦门","青岛","大连","宁波","佛山","苏州","无锡","常州","珠海","多伦多","温哥华","蒙特利尔","卡尔加里","埃德蒙顿",
+  "华沙","布加勒斯特","孟买","金奈","班加罗尔","海得拉巴","加尔各答","新德里","阿什本","赫尔辛基","杜塞尔多夫","斯德哥尔摩",
+  "奥斯陆","哥本哈根","马德里","巴塞罗那","里斯本","罗马","米兰","悉尼","墨尔本","布里斯班","珀斯","奥克兰","惠灵顿",
+  "台北","高雄","台南","台中","基隆"
 ];
 
 function codeCityFromAny(raw){
@@ -448,10 +559,12 @@ function cityZhFromText(s){
 function reverseCityToA2(cityZh){
   for (const k in IATA_TO_CITY_ZH) if (IATA_TO_CITY_ZH[k]===cityZh) return IATA_TO_A2[k]||"";
   const map={
-    "香港":"HK","东京":"JP","大阪":"JP","新加坡":"SG","首尔":"KR","伦敦":"GB","法兰克福":"DE","巴黎":"FR","阿姆斯特丹":"NL","布鲁塞尔":"BE","都柏林":"IE","曼彻斯特":"GB",
-    "迪拜":"AE","洛杉矶":"US","西雅图":"US","旧金山":"US","圣何塞":"US","纽约":"US","新泽西":"US","华盛顿":"US","达拉斯":"US",
-    "苏黎世":"CH","曼谷":"TH","多伦多":"CA","温哥华":"CA","蒙特利尔":"CA","华沙":"PL","布加勒斯特":"RO","孟买":"IN","金奈":"IN",
-    "北京":"CN","上海":"CN","深圳":"CN","广州":"CN","阿什本":"US","赫尔辛基":"FI","杜塞尔多夫":"DE"
+    "香港":"HK","澳门":"MO","台北":"TW","高雄":"TW","东京":"JP","大阪":"JP","新加坡":"SG","首尔":"KR","伦敦":"GB","法兰克福":"DE","巴黎":"FR","阿姆斯特丹":"NL","布鲁塞尔":"BE","都柏林":"IE","曼彻斯特":"GB",
+    "迪拜":"AE","阿布扎比":"AE","洛杉矶":"US","西雅图":"US","旧金山":"US","圣何塞":"US","纽约":"US","新泽西":"US","华盛顿":"US","达拉斯":"US","芝加哥":"US","亚特兰大":"US","迈阿密":"US","波士顿":"US",
+    "苏黎世":"CH","曼谷":"TH","多伦多":"CA","温哥华":"CA","蒙特利尔":"CA","华沙":"PL","布加勒斯特":"RO","孟买":"IN","金奈":"IN","班加罗尔":"IN",
+    "北京":"CN","上海":"CN","深圳":"CN","广州":"CN","天津":"CN","重庆":"CN","成都":"CN","武汉":"CN","南京":"CN","杭州":"CN","厦门":"CN","青岛":"CN",
+    "阿什本":"US","赫尔辛基":"FI","杜塞尔多夫":"DE","斯德哥尔摩":"SE","奥斯陆":"NO","哥本哈根":"DK","马德里":"ES","巴塞罗那":"ES","里斯本":"PT",
+    "罗马":"IT","米兰":"IT","悉尼":"AU","墨尔本":"AU","布里斯班":"AU","珀斯":"AU","奥克兰":"NZ","惠灵顿":"NZ","维也纳":"AT","布拉格":"CZ"
   };
   return map[cityZh]||"";
 }
@@ -548,6 +661,29 @@ function formatSpeedRaw(raw, speedMode, digits){
   return body + "MB/s"; // mode 2
 }
 
+// 清理 multipart 内容的辅助函数
+function cleanMultipartContent(rawContent) {
+  if (!rawContent) return "";
+  
+  return rawContent
+    .split("\n")
+    .map(line => line.trim())
+    .filter(line => {
+      // 过滤掉所有边界行和 Content-Disposition 行
+      if (!line) return false;
+      if (line.includes("------WebKitFormBoundary")) return false;
+      if (line.includes("Content-Disposition")) return false;
+      if (line.includes("saveMode")) return false;
+      if (line.includes("token")) return false;
+      if (line === "overwrite") return false;
+      if (line === "yuu") return false;
+      if (line === "--") return false;
+      // 只保留 IP:端口#地区的格式
+      return line.match(/^[\d\.:\[\]]+#/) || line.match(/^[^#]+#\S+$/);
+    })
+    .join("\n");
+}
+
 /* ---------------- UI (HTML) ---------------- */
 const HTML = `<!doctype html>
 <html lang="zh" data-theme="light">
@@ -557,59 +693,92 @@ const HTML = `<!doctype html>
 <title>YouXuan-API</title>
 <style>
 :root{
-  --bg:#ffffff; --card:rgba(255,255,255,.6); --text:#0b1220; --muted:#6b7280; --border:#e5e7eb;
-  --primary:#3b82f6; --accent:#8b5cf6; --shadow:0 18px 40px rgba(0,0,0,.08);
-  --pill:#f3f4f6; --link:#2563eb;
+  --bg:#f8fafc; --card:rgba(255,255,255,0.85); --text:#0f172a; --muted:#64748b; --border:#e2e8f0;
+  --primary:#3b82f6; --accent:#8b5cf6; --shadow:0 20px 25px -5px rgba(0,0,0,0.1),0 10px 10px -5px rgba(0,0,0,0.04);
+  --pill:#f1f5f9; --link:#2563eb;
+  --frosted-bg: rgba(255,255,255,0.8);
 }
 html[data-theme="dark"]{
-  --bg:#000000; --card:rgba(8,12,24,.6); --text:#e5e7eb; --muted:#9ca3af; --border:#1f2937;
-  --primary:#60a5fa; --accent:#a78bfa; --shadow:0 24px 60px rgba(0,0,0,.35);
-  --pill:#0b1220; --link:#93c5fd;
+  --bg:#0f172a; --card:rgba(30,41,59,0.85); --text:#f1f5f9; --muted:#94a3b8; --border:#334155;
+  --primary:#60a5fa; --accent:#a78bfa; --shadow:0 25px 50px -12px rgba(0,0,0,0.5);
+  --pill:#1e293b; --link:#93c5fd;
+  --frosted-bg: rgba(30,41,59,0.8);
 }
 *{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,PingFang SC,Microsoft YaHei,Helvetica,Arial;position:relative}
-#wp{position:fixed;inset:0;background-position:center;background-size:cover;opacity:.22;filter:blur(12px) saturate(1.15);pointer-events:none;z-index:-1;display:none}
+body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,PingFang SC,Microsoft YaHei,Helvetica,Arial;position:relative;background-image:linear-gradient(135deg,#667eea 0%,#764ba2 100%);}
+#wp{position:fixed;inset:0;background-position:center;background-size:cover;background:var(--frosted-bg);backdrop-filter:blur(20px) saturate(1.8);pointer-events:none;z-index:-1;display:block}
 .center{min-height:100dvh;display:grid;place-items:start center;padding:72px 12px 40px}
 .container{width:min(1100px,96vw)}
 .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
 .brand{display:flex;align-items:center;gap:12px}
-.logoWrap{width:52px;height:52px;border-radius:16px;overflow:hidden;box-shadow:0 12px 28px rgba(59,130,246,.35);display:grid;place-items:center;background:transparent}
+.logoWrap{width:52px;height:52px;border-radius:16px;overflow:hidden;box-shadow:0 12px 28px rgba(59,130,246,.35);display:grid;place-items:center;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);}
 .logoWrap img{width:100%;height:100%;object-fit:cover;display:block}
-.title{font-size:26px;font-weight:900}
+.title{font-size:26px;font-weight:900;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
 .header-right{display:flex;align-items:center;gap:10px}
-.pill{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);background:var(--pill);padding:8px 12px;border-radius:999px;font-weight:700;color:var(--text);text-decoration:none}
-.btn{display:inline-flex;align-items:center;gap:10px;background:linear-gradient(90deg,var(--primary),var(--accent));border:none;border-radius:12px;padding:12px 16px;color:#fff;cursor:pointer;font-weight:800}
+.pill{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);background:var(--pill);padding:8px 12px;border-radius:999px;font-weight:700;color:var(--text);text-decoration:none;backdrop-filter:blur(10px);}
+.btn{display:inline-flex;align-items:center;gap:10px;background:linear-gradient(90deg,var(--primary),var(--accent));border:none;border-radius:12px;padding:12px 16px;color:#fff;cursor:pointer;font-weight:800;transition:all 0.2s ease;}
+.btn:hover{transform:translateY(-2px);box-shadow:0 10px 20px rgba(0,0,0,0.2);}
 .btn.secondary{background:transparent;color:var(--text);border:1px solid var(--border)}
-.card{background:var(--card);backdrop-filter:blur(14px) saturate(1.2);border:1px solid rgba(255,255,255,.35);border-radius:16px;box-shadow:var(--shadow)}
-html[data-theme="dark"] .card{border-color:rgba(148,163,184,.18)}
-.card.pad{padding:18px}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.btn:disabled{opacity:0.6;cursor:not-allowed;}
+.btn.small{padding:6px 10px;font-size:12px;}
+.card{background:var(--card);backdrop-filter:blur(16px) saturate(1.8);border:1px solid rgba(255,255,255,.5);border-radius:20px;box-shadow:var(--shadow)}
+html[data-theme="dark"] .card{border-color:rgba(148,163,184,.25)}
+.card.pad{padding:24px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:20px}
 @media (max-width: 720px){ .row{grid-template-columns:1fr} .title{font-size:22px} .logoWrap{width:44px;height:44px} }
 label{display:block;margin:10px 0 8px;font-weight:700}
 small.help{display:block;color:var(--muted);margin-top:4px}
-textarea,input[type="text"],input[type="number"],select{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--border);background:transparent;color:var(--text)}
+textarea,input[type="text"],input[type="number"],select{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--text);backdrop-filter:blur(10px);}
 textarea{min-height:54px}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
 input[type="file"]{display:none}
 /* chips */
 .filebox{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.uploadBtn{display:inline-flex;align-items:center;gap:8px;background:linear-gradient(90deg,var(--primary),var(--accent));border:none;border-radius:12px;padding:10px 14px;color:#fff;cursor:pointer;font-weight:800}
+.uploadBtn{display:inline-flex;align-items:center;gap:8px;background:linear-gradient(90deg,var(--primary),var(--accent));border:none;border-radius:12px;padding:10px 14px;color:#fff;cursor:pointer;font-weight:800;transition:all 0.2s ease;}
+.uploadBtn:hover{transform:translateY(-2px);}
 .filechips{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px}
-.chip{position:relative;display:inline-flex;align-items:center;gap:10px;border:1px solid var(--border);background:rgba(255,255,255,.65);backdrop-filter:blur(8px);border-radius:12px;padding:8px 12px;box-shadow:0 4px 10px rgba(0,0,0,.05)}
-html[data-theme="dark"] .chip{background:rgba(8,12,24,.65)}
+.chip{position:relative;display:inline-flex;align-items:center;gap:10px;border:1px solid var(--border);background:var(--card);backdrop-filter:blur(8px);border-radius:12px;padding:8px 12px;box-shadow:0 4px 10px rgba(0,0,0,.05);transition:all 0.2s ease;}
+.chip:hover{transform:translateY(-1px);}
+html[data-theme="dark"] .chip{background:var(--card)}
 .gridIcon{width:28px;height:28px;border-radius:8px;background:#10b981;display:grid;place-items:center;color:#fff;font-weight:900}
-.chip .x{position:absolute;top:-6px;right:-6px;width:20px;height:20px;border:none;border-radius:50%;background:#00000022;color:#111;cursor:pointer}
+.chip .x{position:absolute;top:-6px;right:-6px;width:20px;height:20px;border:none;border-radius:50%;background:#00000022;color:#111;cursor:pointer;transition:all 0.2s ease;}
+.chip .x:hover{background:#00000044;}
 html[data-theme="dark"] .chip .x{background:#ffffff33;color:#fff}
 .chip .eye{border:none;background:transparent;cursor:pointer}
+/* drag & drop */
+.drop-zone{border:2px dashed var(--border);border-radius:12px;padding:40px 20px;text-align:center;transition:all 0.3s ease;background:var(--card);backdrop-filter:blur(10px);}
+.drop-zone.active{border-color:var(--primary);background:rgba(59,130,246,0.1);}
+.drop-zone p{margin:0;color:var(--muted);}
 /* modal & toast */
-.modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.35);padding:18px;z-index:50}
-.panel{max-width:900px;width:100%;border-radius:16px;padding:18px;background:var(--card);backdrop-filter:blur(14px) saturate(1.2);border:1px solid rgba(255,255,255,.35)}
-html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
+.modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.5);padding:18px;z-index:50}
+.panel{max-width:900px;width:100%;border-radius:20px;padding:24px;background:var(--card);backdrop-filter:blur(20px) saturate(1.8);border:1px solid rgba(255,255,255,.5);box-shadow:var(--shadow)}
+html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
 .panel .title{font-weight:900;margin-bottom:8px}
-.actions{display:flex;justify-content:flex-end;gap:10px;margin-top:10px}
-.toast{position:fixed;right:18px;bottom:18px;background:var(--card);border:1px solid var(--border);color:var(--text);padding:12px 16px;border-radius:12px;opacity:0;transform:translateY(10px);transition:all .25s ease;z-index:60}
+.actions{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}
+.toast{position:fixed;right:18px;bottom:18px;background:var(--card);border:1px solid var(--border);color:var(--text);padding:12px 16px;border-radius:12px;opacity:0;transform:translateY(10px);transition:all .25s ease;z-index:60;backdrop-filter:blur(10px);}
 .toast.show{opacity:1;transform:translateY(0)}
+/* save mode */
+.save-mode{display:flex;gap:10px;margin:10px 0;}
+.save-mode-btn{flex:1;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--text);cursor:pointer;text-align:center;transition:all 0.2s ease;}
+.save-mode-btn.active{background:linear-gradient(90deg,var(--primary),var(--accent));color:#fff;border-color:var(--primary);}
+/* latency results */
+.latency-results{margin-top:10px;max-height:300px;overflow-y:auto;}
+.latency-item{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-radius:8px;margin-bottom:5px;background:var(--pill);}
+.latency-success{background:rgba(16,185,129,0.1);border-left:4px solid #10b981;}
+.latency-failed{background:rgba(239,68,68,0.1);border-left:4px solid #ef4444;}
+.latency-value{font-weight:bold;}
+.latency-value.good{color:#10b981;}
+.latency-value.medium{color:#f59e0b;}
+.latency-value.poor{color:#ef4444;}
+.latency-progress{width:100%;height:6px;background:var(--border);border-radius:3px;margin-top:5px;overflow:hidden;}
+.latency-progress-bar{height:100%;background:linear-gradient(90deg,var(--primary),var(--accent));transition:width 0.3s ease;}
+.testing-info{background:rgba(59,130,246,0.1);border-left:4px solid var(--primary);padding:10px;border-radius:8px;margin:10px 0;}
+/* output area with test buttons */
+.output-line{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border);}
+.output-line:last-child{border-bottom:none;}
+.output-text{flex:1;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;}
+.output-actions{display:flex;gap:5px;margin-left:10px;}
 </style>
 </head>
 <body>
@@ -632,17 +801,20 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
         <div class="row">
           <div>
             <label>上传文件（可多次追加）</label>
-            <div class="filebox">
-              <label class="uploadBtn" for="files">📂 选择文件</label>
-              <input type="file" id="files" name="files" multiple />
-              <button class="btn secondary" id="previewAll" type="button">👁 预览全部</button>
+            <div class="drop-zone" id="dropZone">
+              <p>📂 拖放文件到此处或</p>
+              <div class="filebox">
+                <label class="uploadBtn" for="files">选择文件</label>
+                <input type="file" id="files" name="files" multiple />
+                <button class="btn secondary" id="previewAll" type="button">👁 预览全部</button>
+              </div>
             </div>
             <div id="chips" class="filechips"></div>
           </div>
 
           <div>
             <label>或直接粘贴文本</label>
-            <textarea id="pasted" rows="4" placeholder="可粘贴优选域名（如：visa.cn）或整段 CSV/TXT。域名不输出端口；IP 未写端口时，请在“高级设置→输出端口”选择。"></textarea>
+            <textarea id="pasted" rows="4" placeholder="可粘贴优选域名（如：visa.cn）或整段 CSV/TXT。域名不输出端口；IP 未写端口时，请在"高级设置→输出端口"选择。"></textarea>
           </div>
         </div>
 
@@ -662,6 +834,12 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
               <button class="btn secondary" id="personalBtn" type="button">🎨 个性化设置</button>
               <button class="btn secondary" id="advBtn" type="button">⚙️ 高级设置</button>
               <button class="btn secondary" id="quotaBtn" type="button">🧮 配额与限制</button>
+              <button class="btn secondary" id="latencyBtn" type="button">📡 本地延迟测试</button>
+              <button class="btn secondary" id="testAllBtn" type="button">🧪 测试全部节点</button>
+            </div>
+            <div class="save-mode">
+              <div class="save-mode-btn active" data-mode="overwrite">覆盖保存</div>
+              <div class="save-mode-btn" data-mode="append">追加保存</div>
             </div>
           </div>
         </div>
@@ -669,8 +847,11 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
 
       <div class="card pad" style="margin-top:14px">
         <div class="progress" id="progWrap" style="display:none"><div class="bar" id="bar" style="height:10px;background:linear-gradient(90deg,var(--primary),var(--accent));border-radius:999px;width:0%"></div></div>
-        <textarea id="out" class="mono" rows="18" placeholder="点击“生成预览”后在此显示结果"></textarea>
+        <div id="outputContainer" style="max-height:400px;overflow-y:auto;margin-bottom:10px;">
+          <textarea id="out" class="mono" rows="18" placeholder="点击"生成预览"后在此显示结果" style="width:100%;border:none;background:transparent;resize:none;"></textarea>
+        </div>
         <div id="miniStats" class="muted" style="margin-top:8px;line-height:1.8"></div>
+        <div id="latencyResults" class="latency-results"></div>
       </div>
     </div>
   </div>
@@ -694,9 +875,6 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
           <input type="file" id="bgFile" accept="image/*"/>
           <label class="uploadBtn" for="bgFile">🖼️ 选择背景</label>
           <button class="btn secondary" id="resetBg" type="button">↺ 恢复默认（跟随主题黑/白）</button>
-          <label style="margin-top:10px">背景透明度</label>
-          <input type="range" id="bgOpacity" min="0" max="100" step="1" value="22" />
-          <small class="help">自定义背景生效时可调（0%—100%）。默认背景为纯黑/白。</small>
         </div>
         <div>
           <label>上传 Logo（全站默认）</label>
@@ -756,7 +934,7 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
               <option value="0">保留 0 位小数</option>
             </select>
           </div>
-          <small class="help">自动识别并换算 kb/s、kbps、Mb/s、Mbps、KiB/s 等到 MB/s；选择“0 不显示”则完全不拼接速度。</small>
+          <small class="help">自动识别并换算 kb/s、kbps、Mb/s、Mbps、KiB/s 等到 MB/s；选择"0 不显示"则完全不拼接速度。</small>
         </div>
         <div>
           <label>输出端口（仅对 IP 生效；域名不带端口）</label>
@@ -786,7 +964,7 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
               <option value="domain" selected>使用域名作为备注</option>
               <option value="custom">自定义文本</option>
             </select>
-            <input type="text" id="domainRemarkText" placeholder="自定义备注文本（仅当选择“自定义”时）"/>
+            <input type="text" id="domainRemarkText" placeholder="自定义备注文本（仅当选择"自定义"时）"/>
           </div>
           <small class="help">仅对优选域名生效（如 visa.cn）；IP 不套此规则。</small>
         </div>
@@ -830,18 +1008,63 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
 
       <div class="row">
         <div>
+          <label>速度过滤（最小 MB/s）</label>
+          <input type="number" id="minSpeed" min="0" step="0.1" placeholder="0 = 不限制"/>
+          <small class="help">不显示速度低于此值的节点（单位：MB/s）</small>
+        </div>
+        <div>
+          <!-- 删除延迟过滤设置 -->
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
           <label>最终保留前 N 行（全局）</label>
           <input type="number" id="maxLines" min="0" placeholder="0 = 不限制"/>
           <small class="help">应用完上面所有限制后，再整体截取。</small>
         </div>
         <div>
           <label>排序与优先级</label>
-          <label class="muted"><input type="checkbox" id="preferLowLat" checked/> 若检测到“延迟/latency/ping”等列，则按“国家最小延迟 → 行延迟”升序排序</label>
+          <label class="muted"><input type="checkbox" id="preferLowLat" checked/> 若检测到"延迟/latency/ping"等列，则按"国家最小延迟 → 行延迟"升序排序</label>
           <small class="help">延迟列不存在时，不影响原顺序。</small>
         </div>
       </div>
 
       <div class="actions"><button class="btn secondary" id="closeQuota" type="button">关闭</button></div>
+    </div>
+  </div>
+
+  <!-- 本地延迟测试 -->
+  <div class="modal" id="latencyModal">
+    <div class="panel">
+      <div class="title">本地延迟测试</div>
+      <div class="testing-info">
+        <strong>测试说明：</strong> 此功能使用您本地浏览器网络真实连接测试服务器的延迟，反映您当前网络到各服务器的真实连接质量。
+      </div>
+      <div class="row">
+        <div>
+          <label>测试服务器</label>
+          <textarea id="latencyServers" rows="6" placeholder="输入要测试的服务器，每行一个，格式：IP:端口 或 域名:端口&#10;例如：&#10;183.236.51.220:7005&#10;visa.cn:443&#10;[2606:4700::1]:2053"></textarea>
+          <div style="margin-top:10px;">
+            <button class="btn secondary small" id="importFromPreview">从预览导入</button>
+            <button class="btn secondary small" id="clearLatencyList">清空列表</button>
+          </div>
+        </div>
+        <div>
+          <label>测试设置</label>
+          <input type="number" id="latencyTimeout" min="100" max="10000" value="400" placeholder="超时时间（毫秒）"/>
+          <input type="number" id="latencyThreshold" min="50" max="5000" value="300" placeholder="延迟阈值（毫秒）"/>
+          <input type="text" id="testUrl" placeholder="自定义测速地址（可选）" value="/"/>
+          <label class="muted"><input type="checkbox" id="latencyAutoFilter" checked/> 自动过滤高延迟节点</label>
+          <small class="help">测试完成后，自动过滤延迟高于此值的节点（默认300ms）</small>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" id="startLatency" type="button">🚀 开始测试</button>
+        <button class="btn secondary" id="testAndUpload" type="button">📡 测试并上传</button>
+        <button class="btn secondary" id="closeLatency" type="button">关闭</button>
+      </div>
+      <div id="latencyResultsModal" class="latency-results" style="margin-top:20px;max-height:300px;"></div>
     </div>
   </div>
 
@@ -853,7 +1076,7 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
   function toast(t,k){var x=$('toast');x.textContent=t;x.style.borderColor=(k==='error')?'#ef4444':(k==='success')?'#10b981':'#e5e7eb';x.classList.add('show');setTimeout(function(){x.classList.remove('show')},2200)}
   function openM(m){m.style.display='flex'} function closeM(m){m.style.display='none'}
 
-  // Theme + default bg (white/black)
+  // Theme + default bg (frosted glass)
   var TH='YX:theme', th=localStorage.getItem(TH)||'light';
   applyTheme(th);
   $('themeBtn').onclick=function(){var next=document.documentElement.dataset.theme==='light'?'dark':'light';applyTheme(next);localStorage.setItem(TH,next);applyBgFromState();};
@@ -869,14 +1092,12 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
       if(p.prefs.logo){ localStorage.setItem('YX:logo',p.prefs.logo); }
     }
     applyBgFromState(); applyLogo(localStorage.getItem('YX:logo'));
-    const op = localStorage.getItem('YX:bgOpacity') || 22; $('bgOpacity').value = op; applyBgOpacity(op);
   }).catch(()=>{ applyBgFromState(); applyLogo(localStorage.getItem('YX:logo')); });
 
-  const DEFAULT_LOGO = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128"><rect rx="24" ry="24" width="128" height="128" fill="%230b5cff"/><text x="64" y="78" font-family="Arial" font-size="56" text-anchor="middle" fill="white" font-weight="900">YX</text></svg>';
+  const DEFAULT_LOGO = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><defs><linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:%23667eea;stop-opacity:1"/><stop offset="100%" style="stop-color:%23764ba2;stop-opacity:1"/></linearGradient></defs><rect rx="24" ry="24" width="128" height="128" fill="url(%23grad)"/><text x="64" y="80" font-family="Arial" font-size="48" text-anchor="middle" fill="white" font-weight="900" font-style="italic">YX</text></svg>';
   function applyLogo(src){ $('logoImg').src = src || DEFAULT_LOGO; }
 
-  function applyBg(data){ if (data){ $('wp').style.backgroundImage = 'url('+data+')'; $('wp').style.display='block'; } else { $('wp').style.backgroundImage='none'; $('wp').style.display='none'; } }
-  function applyBgOpacity(val){ $('wp').style.opacity = String(Math.max(0,Math.min(100,parseInt(val||'22',10)))/100); }
+  function applyBg(data){ if (data){ $('wp').style.backgroundImage = 'url('+data+')'; $('wp').style.display='block'; } else { $('wp').style.backgroundImage='none'; $('wp').style.display='block'; } }
   function applyBgFromState(){ const data=localStorage.getItem('YX:bg'); if (data){ applyBg(data); } else { applyBg(''); } }
 
   // bind uploads
@@ -896,7 +1117,6 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
   bindDataFile('bgFile','YX:bg',applyBg);
   bindDataFile('logoFile','YX:logo',applyLogo);
 
-  $('bgOpacity').addEventListener('input', function(){ localStorage.setItem('YX:bgOpacity', this.value); applyBgOpacity(this.value); });
   $('resetBg').onclick=function(){ localStorage.removeItem('YX:bg'); applyBgFromState(); toast('已切回默认背景（随主题）','success'); };
   $('resetLogo').onclick=function(){ localStorage.removeItem('YX:logo'); applyLogo(''); toast('已恢复默认 Logo','success'); };
 
@@ -904,7 +1124,7 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
   $('savePrefs').onclick=async function(){
     const t=$('token').value||''; if(!t){ toast('请在上方填写 TOKEN 再保存','error'); return; }
     try{
-      const res=await fetch('/api/prefs',{method:'POST',headers:{'content-type':'application/json','x-token':t},body:JSON.stringify({bg:localStorage.getItem('YX:bg')||'', bgOpacity:parseInt(localStorage.getItem('YX:bgOpacity')||'22',10), logo:localStorage.getItem('YX:logo')||''})});
+      const res=await fetch('/api/prefs',{method:'POST',headers:{'content-type':'application/json','x-token':t},body:JSON.stringify({bg:localStorage.getItem('YX:bg')||'', bgOpacity:80, logo:localStorage.getItem('YX:logo')||''})});
       const j=await res.json(); if(!j.ok) throw new Error(j.error||'保存失败'); toast('已保存为全站默认','success');
     }catch(e){ toast('保存失败：'+(e&&e.message?e.message:e),'error'); }
   };
@@ -916,13 +1136,39 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
     }catch(e){ toast('清除失败：'+(e&&e.message?e.message:e),'error'); }
   };
 
+  // Drag & drop
+  const dropZone = $('dropZone');
+  ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+    dropZone.addEventListener(eventName, preventDefaults, false);
+  });
+  function preventDefaults (e) { e.preventDefault(); e.stopPropagation(); }
+  ['dragenter', 'dragover'].forEach(eventName => {
+    dropZone.addEventListener(eventName, highlight, false);
+  });
+  ['dragleave', 'drop'].forEach(eventName => {
+    dropZone.addEventListener(eventName, unhighlight, false);
+  });
+  function highlight() { dropZone.classList.add('active'); }
+  function unhighlight() { dropZone.classList.remove('active'); }
+  dropZone.addEventListener('drop', handleDrop, false);
+  function handleDrop(e) {
+    const dt = e.dataTransfer;
+    const files = dt.files;
+    handleFiles(files);
+  }
+  function handleFiles(files) {
+    const arr = Array.from(files||[]); 
+    const map = new Set(fileList.map(uniqKey));
+    arr.forEach(f=>{ const k=uniqKey(f); if(!map.has(k)){ fileList.push(f); map.add(k);} });
+    renderChips();
+  }
+
   // Multi-file append
   let fileList=[];
   function uniqKey(f){ return [f.name,f.size,f.lastModified].join('|'); }
   $('files').addEventListener('change', function(){
-    const arr=Array.from(this.files||[]); const map=new Set(fileList.map(uniqKey));
-    arr.forEach(f=>{ const k=uniqKey(f); if(!map.has(k)){ fileList.push(f); map.add(k);} });
-    this.value=''; renderChips();
+    handleFiles(this.files);
+    this.value='';
   });
   const chips=$('chips');
   function renderChips(){
@@ -938,9 +1184,23 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
   $('previewAll').onclick=async function(){ if(!fileList.length){ toast('请先选择文件','error'); return; } let all=''; for(const f of fileList){ all += (await f.text()) + '\\n'; } $('previewBox').textContent=all.trim().split('\\n').slice(0,50).join('\\n'); openM($('previewModal')); };
   $('closePreview').onclick=function(){ closeM($('previewModal')); };
 
+  // Save mode
+  let currentSaveMode = 'overwrite';
+  document.querySelectorAll('.save-mode-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.save-mode-btn').forEach(b => b.classList.remove('active'));
+      this.classList.add('active');
+      currentSaveMode = this.dataset.mode;
+      localStorage.setItem('YX:saveMode', currentSaveMode);
+    });
+  });
+  // Load saved mode
+  const savedMode = localStorage.getItem('YX:saveMode') || 'overwrite';
+  document.querySelector(\`.save-mode-btn[data-mode="\${savedMode}"]\`).click();
+
   // Persisted settings
   const nodePrefix=$('nodePrefix'), nodeSuffix=$('nodeSuffix'), decorateFlag=$('decorateFlag');
-  const digits=$('digits'), speedMode=$('speedMode');
+  const digits=$('digits'), speedMode=$('speedMode'), minSpeed=$('minSpeed');
   const quotaV4=$('quotaV4'), quotaV6=$('quotaV6'), maxLines=$('maxLines'), quotaPerTop=$('quotaPerTop'), quotaTopN=$('quotaTopN'), preferLowLat=$('preferLowLat');
   const regionLang=$('regionLang'), regionDetail=$('regionDetail');
   const token=$('token');
@@ -952,9 +1212,10 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
 
   nodePrefix.value = load('nodePrefix','');   nodeSuffix.value = load('nodeSuffix','');
 
-  // speedMode & digits
+  // speedMode & digits & minSpeed
   speedMode.value = load('speedMode','2');
   digits.value = load('digits','2');
+  minSpeed.value = load('minSpeed','0');
 
   quotaV4.value = load('quotaV4','0');  quotaV6.value = load('quotaV6','0');
   quotaPerTop.value = load('quotaPerTop','0'); quotaTopN.value = load('quotaTopN','0'); maxLines.value = load('maxLines','0');
@@ -970,6 +1231,7 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
     nodePrefix.addEventListener(ev,()=>save('nodePrefix',nodePrefix.value||''));   nodeSuffix.addEventListener(ev,()=>save('nodeSuffix',nodeSuffix.value||''));
     digits.addEventListener(ev,()=>save('digits',digits.value||'2'));
     speedMode.addEventListener(ev,()=>save('speedMode',speedMode.value||'2'));
+    minSpeed.addEventListener(ev,()=>save('minSpeed',minSpeed.value||'0'));
 
     quotaV4.addEventListener(ev,()=>save('quotaV4',quotaV4.value||'0'));  quotaV6.addEventListener(ev,()=>save('quotaV6',quotaV6.value||'0'));
     quotaPerTop.addEventListener(ev,()=>save('quotaPerTop',quotaPerTop.value||'0')); quotaTopN.addEventListener(ev,()=>save('quotaTopN',quotaTopN.value||'0')); maxLines.addEventListener(ev,()=>save('maxLines',maxLines.value||'0'));
@@ -984,28 +1246,407 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
   $('personalBtn').onclick=function(){ openM($('personalModal')); };
   $('advBtn').onclick=function(){ openM($('advModal')); };
   $('quotaBtn').onclick=function(){ openM($('quotaModal')); };
+  $('latencyBtn').onclick=function(){ openM($('latencyModal')); };
   $('closePersonal').onclick=function(){ closeM($('personalModal')); };
   $('closeAdv').onclick=function(){ closeM($('advModal')); };
   $('closeQuota').onclick=function(){ closeM($('quotaModal')); };
+  $('closeLatency').onclick=function(){ closeM($('latencyModal')); };
+
+  // Local Latency Test functionality
+  let latencyTestResults = [];
+  let currentPreviewLines = [];
+  
+  // 从预览导入到延迟测试
+  $('importFromPreview').onclick=function(){
+    if (currentPreviewLines.length === 0) {
+      toast('请先生成预览','error');
+      return;
+    }
+    
+    const servers = currentPreviewLines.map(line => {
+      // 解析行格式：地址#备注
+      const [address, remark] = line.split('#');
+      return address;
+    }).filter(addr => addr);
+    
+    $('latencyServers').value = servers.join('\\n');
+    toast(\`已导入 \${servers.length} 个服务器到测试列表\`, 'success');
+  };
+  
+  // 清空延迟测试列表
+  $('clearLatencyList').onclick=function(){
+    $('latencyServers').value = '';
+    toast('已清空测试列表','success');
+  };
+  
+  // 本地延迟测试函数 - 放宽条件版本
+  async function testLocalLatency(server, timeout = 400, testPath = '/') {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => {
+        controller.abort();
+        resolve({
+          ...server,
+          latency: timeout,
+          status: 'timeout',
+          success: false,
+          error: '请求超时'
+        });
+      }, timeout);
+      
+      const protocol = window.location.protocol === 'https:' ? 'https' : 'http';
+      const testUrl = \`\${protocol}://\${server.host}:\${server.port}\${testPath}\`;
+      
+      fetch(testUrl, {
+        method: 'HEAD',
+        mode: 'no-cors',
+        signal: controller.signal
+      })
+      .then(() => {
+        clearTimeout(timeoutId);
+        const latency = Date.now() - start;
+        // 放宽条件：只要有响应就认为是成功的
+        resolve({
+          ...server,
+          latency,
+          status: 'success',
+          success: true,
+          error: ''
+        });
+      })
+      .catch(error => {
+        clearTimeout(timeoutId);
+        const latency = Date.now() - start;
+        
+        // 放宽条件：只要在超时时间内有响应（即使出错），都认为是可用的
+        const success = latency < timeout;
+        
+        resolve({
+          ...server,
+          latency,
+          status: success ? 'success' : 'failed',
+          success: success,
+          error: success ? '连接可用（忽略协议错误）' : \`连接失败: \${error.message}\`
+        });
+      });
+    });
+  }
+  
+  // 批量本地延迟测试
+  async function batchLocalLatencyTest(servers, timeout = 400, testPath = '/', concurrency = 3) {
+    const results = [];
+    
+    for (let i = 0; i < servers.length; i += concurrency) {
+      const batch = servers.slice(i, i + concurrency);
+      const batchPromises = batch.map(server => testLocalLatency(server, timeout, testPath));
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+      
+      // 更新进度
+      const progress = ((i + batch.length) / servers.length * 100).toFixed(1);
+      $('latencyResultsModal').innerHTML = \`<div class="testing-info">测试进度: \${progress}% (\${i + batch.length}/\${servers.length})</div>\`;
+      
+      // 小延迟避免过于频繁
+      if (i + concurrency < servers.length) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+    
+    return results;
+  }
+  
+  $('startLatency').onclick=async function(){
+    const serversText = $('latencyServers').value.trim();
+    if (!serversText) {
+      toast('请输入要测试的服务器','error');
+      return;
+    }
+
+    const servers = serversText.split('\\n')
+      .map(line => line.trim())
+      .filter(line => line)
+      .map(line => {
+        // 解析服务器格式
+        if (line.startsWith('[')) {
+          // IPv6 格式: [2606:4700::1]:2053
+          const ipv6Match = line.match(/\\[([^\\]]+)\\]:(\\d+)/);
+          if (ipv6Match) {
+            return { host: ipv6Match[1], port: parseInt(ipv6Match[2]), original: line };
+          }
+        } else if (line.includes(':')) {
+          // IPv4 或域名格式: 127.0.0.1:1234 或 visa.cn:443
+          const parts = line.split(':');
+          if (parts.length === 2) {
+            return { host: parts[0], port: parseInt(parts[1]), original: line };
+          }
+        } else {
+          // 没有端口，使用默认端口
+          return { host: line, port: 443, original: line };
+        }
+        return null;
+      })
+      .filter(server => server && server.host);
+
+    if (servers.length === 0) {
+      toast('没有有效的服务器格式','error');
+      return;
+    }
+
+    const timeout = parseInt($('latencyTimeout').value) || 400;
+    const testPath = $('testUrl').value || '/';
+
+    $('startLatency').disabled = true;
+    $('testAndUpload').disabled = true;
+    $('startLatency').textContent = '测试中...';
+    $('latencyResultsModal').innerHTML = '<div class="testing-info">正在使用本地网络测试 ' + servers.length + ' 个服务器的真实连接延迟...</div>';
+
+    try {
+      const results = await batchLocalLatencyTest(servers, timeout, testPath, 3);
+      latencyTestResults = results;
+      
+      // 显示结果
+      let html = '';
+      let successCount = 0;
+      let totalLatency = 0;
+      
+      results.forEach(server => {
+        const latencyClass = server.latency < 200 ? 'good' : server.latency < 500 ? 'medium' : 'poor';
+        const statusClass = server.success ? 'latency-success' : 'latency-failed';
+        
+        if (server.success) {
+          successCount++;
+          totalLatency += server.latency;
+        }
+        
+        html += \`
+          <div class="latency-item \${statusClass}">
+            <div>
+              <div>\${server.original}</div>
+              <div class="latency-progress">
+                <div class="latency-progress-bar" style="width: \${Math.min(server.latency / 1000 * 100, 100)}%"></div>
+              </div>
+            </div>
+            <div class="latency-value \${latencyClass}">\${server.latency}ms</div>
+            <div>\${server.success ? '✅' : '❌'}</div>
+          </div>
+        \`;
+      });
+
+      const avgLatency = successCount > 0 ? Math.round(totalLatency / successCount) : 0;
+      
+      html += \`<div style="margin-top:10px;font-weight:bold;text-align:center">成功率: \${successCount}/\${servers.length} (\${((successCount/servers.length)*100).toFixed(1)}%) | 平均延迟: \${avgLatency}ms</div>\`;
+      
+      $('latencyResultsModal').innerHTML = html;
+      
+      toast(\`测试完成: \${successCount}/\${servers.length} 个服务器可用，平均延迟 \${avgLatency}ms\`, 'success');
+      
+    } catch (error) {
+      toast('测试失败: ' + error.message, 'error');
+      $('latencyResultsModal').innerHTML = '<div style="color:#ef4444">测试失败: ' + error.message + '</div>';
+    } finally {
+      $('startLatency').disabled = false;
+      $('testAndUpload').disabled = false;
+      $('startLatency').textContent = '🚀 开始测试';
+    }
+  };
+
+  // 测试并上传功能 - 生成简洁格式
+  $('testAndUpload').onclick=async function(){
+    if (latencyTestResults.length === 0) {
+      toast('请先进行延迟测试','error');
+      return;
+    }
+
+    if(!token.value){ 
+      toast('请填写验证 Token','error'); 
+      $('token').focus(); 
+      return; 
+    }
+
+    const threshold = parseInt($('latencyThreshold').value) || 300;
+    const filteredResults = latencyTestResults.filter(server => 
+      server.success && server.latency <= threshold
+    );
+
+    if (filteredResults.length === 0) {
+      toast('没有符合条件的服务器','error');
+      return;
+    }
+
+    // 生成简洁格式的订阅内容
+    const subscriptionLines = filteredResults.map(server => {
+      const address = server.original.split('#')[0].trim();
+      return \`\${address}#香港\`; // 可以根据需要修改地区
+    });
+
+    const subscriptionContent = subscriptionLines.join('\\n');
+
+    // 使用FormData确保格式正确
+    const formData = new FormData();
+    formData.append('content', subscriptionContent);
+    formData.append('saveMode', currentSaveMode);
+    formData.append('token', token.value);
+
+    try {
+      const res = await fetch('/api/publish?token=' + encodeURIComponent(token.value), {
+        method: 'POST',
+        body: formData
+      });
+      
+      const j = await res.json(); 
+      if(!j.ok) throw new Error(j.error || '发布失败');
+      
+      toast('成功上传 ' + filteredResults.length + ' 个节点', 'success');
+      closeM($('latencyModal'));
+      
+    } catch(e) { 
+      toast('上传失败: ' + (e && e.message ? e.message : e), 'error'); 
+    }
+  };
+
+  // 测试全部节点
+  $('testAllBtn').onclick=function(){
+    if (currentPreviewLines.length === 0) {
+      toast('请先生成预览','error');
+      return;
+    }
+    
+    const servers = currentPreviewLines.map(line => {
+      const [address] = line.split('#');
+      return address;
+    }).filter(addr => addr);
+    
+    $('latencyServers').value = servers.join('\\n');
+    openM($('latencyModal'));
+    toast(\`已导入 \${servers.length} 个节点到测试列表\`, 'success');
+  };
+
+  // 更新输出区域显示，添加测试按钮
+  function updateOutputWithTestButtons(lines) {
+    currentPreviewLines = lines;
+    const container = $('outputContainer');
+    const textarea = $('out');
+    
+    // 清空容器
+    container.innerHTML = '';
+    
+    // 创建新的文本区域
+    const newTextarea = document.createElement('textarea');
+    newTextarea.id = 'out';
+    newTextarea.className = 'mono';
+    newTextarea.rows = 18;
+    newTextarea.placeholder = '点击"生成预览"后在此显示结果';
+    newTextarea.style.width = '100%';
+    newTextarea.style.border = 'none';
+    newTextarea.style.background = 'transparent';
+    newTextarea.style.resize = 'none';
+    newTextarea.value = lines.join('\\n');
+    
+    // 创建带按钮的显示区域
+    const linesContainer = document.createElement('div');
+    linesContainer.style.maxHeight = '400px';
+    linesContainer.style.overflowY = 'auto';
+    
+    lines.forEach((line, index) => {
+      const lineDiv = document.createElement('div');
+      lineDiv.className = 'output-line';
+      
+      const textSpan = document.createElement('span');
+      textSpan.className = 'output-text';
+      textSpan.textContent = line;
+      
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'output-actions';
+      
+      const testBtn = document.createElement('button');
+      testBtn.className = 'btn secondary small';
+      testBtn.textContent = '测试';
+      testBtn.title = '测试此节点延迟';
+      testBtn.onclick = () => {
+        $('latencyServers').value = line.split('#')[0];
+        openM($('latencyModal'));
+        toast('已添加到测试列表', 'success');
+      };
+      
+      actionsDiv.appendChild(testBtn);
+      lineDiv.appendChild(textSpan);
+      lineDiv.appendChild(actionsDiv);
+      linesContainer.appendChild(lineDiv);
+    });
+    
+    // 添加标签页切换
+    const tabContainer = document.createElement('div');
+    tabContainer.style.display = 'flex';
+    tabContainer.style.marginBottom = '10px';
+    tabContainer.style.borderBottom = '1px solid var(--border)';
+    
+    const textTab = document.createElement('button');
+    textTab.textContent = '纯文本视图';
+    textTab.style.padding = '8px 16px';
+    textTab.style.border = 'none';
+    textTab.style.background = 'transparent';
+    textTab.style.borderBottom = '2px solid var(--primary)';
+    textTab.style.cursor = 'pointer';
+    
+    const buttonTab = document.createElement('button');
+    buttonTab.textContent = '带测试按钮视图';
+    buttonTab.style.padding = '8px 16px';
+    buttonTab.style.border = 'none';
+    buttonTab.style.background = 'transparent';
+    buttonTab.style.cursor = 'pointer';
+    
+    let currentView = 'buttons';
+    
+    textTab.onclick = () => {
+      if (currentView === 'buttons') {
+        container.innerHTML = '';
+        container.appendChild(newTextarea);
+        textTab.style.borderBottom = '2px solid var(--primary)';
+        buttonTab.style.borderBottom = 'none';
+        currentView = 'text';
+      }
+    };
+    
+    buttonTab.onclick = () => {
+      if (currentView === 'text') {
+        container.innerHTML = '';
+        container.appendChild(tabContainer);
+        container.appendChild(linesContainer);
+        textTab.style.borderBottom = 'none';
+        buttonTab.style.borderBottom = '2px solid var(--primary)';
+        currentView = 'buttons';
+      }
+    };
+    
+    tabContainer.appendChild(textTab);
+    tabContainer.appendChild(buttonTab);
+    
+    // 默认显示带按钮的视图
+    container.appendChild(tabContainer);
+    container.appendChild(linesContainer);
+  }
 
   // progress + actions
   var go=$('go'), upload=$('upload'), copy=$('copy'), statsBtn=$('statsBtn');
-  var out=$('out'), progWrap=$('progWrap'), bar=$('bar'), mini=$('miniStats');
+  var out=$('out'), progWrap=$('progWrap'), bar=$('bar'), mini=$('miniStats'), latencyResults=$('latencyResults');
   function showProg(){ progWrap.style.display='block'; bar.style.width='0%'; }
 
   var last=null;
   go.onclick=async function(){
     try{
-      go.disabled=true; out.value=''; mini.textContent=''; showProg(); await new Promise(r=>setTimeout(r,60));
+      go.disabled=true; out.value=''; mini.textContent=''; latencyResults.innerHTML=''; showProg(); await new Promise(r=>setTimeout(r,60));
 
       var fd=new FormData();
       (fileList||[]).forEach(f=>fd.append('files',f));
       fd.append('pasted',$('pasted').value||'');
+      fd.append('saveMode', currentSaveMode);
 
       // advanced
       fd.append('nodePrefix',nodePrefix.value||''); fd.append('nodeSuffix',nodeSuffix.value||'');
       fd.append('digits',digits.value||'2');
-      fd.append('speedMode',speedMode.value||'2'); // <<< patched
+      fd.append('speedMode',speedMode.value||'2');
+      fd.append('minSpeed',minSpeed.value||'0');
       fd.append('regionLang',regionLang.value||'zh'); fd.append('regionDetail',regionDetail.value||'country');
       if(decorateFlag.checked) fd.append('decorateFlag','on');
       fd.append('outPortSel',outPortSel.value||''); fd.append('outPortCus',outPortCus.value||'');
@@ -1019,18 +1660,25 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
       const res=await fetch('/api/preview',{method:'POST',body:fd});
       const j=await res.json();
       if(!j.ok) throw new Error(j.error||'未知错误');
-      bar.style.width='100%'; out.value=(j.lines||[]).join('\\n'); last=j;
+      bar.style.width='100%'; 
+      
+      // 使用新的带按钮的显示方式
+      updateOutputWithTestButtons(j.lines || []);
+      last=j;
 
       const s=j.stats||{};
-      mini.textContent=[
+      let statsText = [
         '输入总行数:'+(s.rows_total??'—'),
         'IPv4:'+(s.ipv4_count??'—'),
         'IPv6:'+(s.ipv6_count??'—'),
         '域名:'+(s.domain_count??'—'),
         '带速度:'+(s.with_speed_count??'—'),
+        '速度过滤:'+(s.skipped_speed??'—'),
         '配额后行数:'+(s.total_after_quota??'—'),
         '最终输出行数:'+(s.output_count??(j.count??'—'))
-      ].join('  ·  ');
+      ];
+
+      mini.textContent = statsText.join('  ·  ');
 
       toast('处理完成 ✓','success');
     }catch(e){ toast('处理失败：'+(e&&e.message?e.message:e),'error'); }
@@ -1038,8 +1686,19 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
   };
 
   copy.onclick=async function(){
-    try{ out.select(); document.execCommand('copy'); toast('已复制','success'); }
-    catch(e){ try{ await navigator.clipboard.writeText(out.value); toast('已复制','success'); } catch(_){ toast('复制失败','error'); } }
+    try{ 
+      const outText = $('out').value;
+      await navigator.clipboard.writeText(outText); 
+      toast('已复制','success'); 
+    } catch(_){ 
+      try{ 
+        $('out').select(); 
+        document.execCommand('copy'); 
+        toast('已复制','success'); 
+      } catch(e){ 
+        toast('复制失败','error'); 
+      } 
+    }
   };
 
   $('statsBtn').onclick=function(){
@@ -1052,25 +1711,29 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
       'IPv6: '+(s.ipv6_count??'—'),
       '域名: '+(s.domain_count??'—'),
       '带速度: '+(s.with_speed_count??'—'),
+      '速度过滤: '+(s.skipped_speed??0),
       '每国 IPv4: '+(s.quota_v4??0),
       '每国 IPv6: '+(s.quota_v6??0),
       '每国前 N: '+(document.getElementById('quotaPerTop').value||0),
       '全局前 N: '+(document.getElementById('quotaTopN').value||0),
+      '最小速度: '+(document.getElementById('minSpeed').value||0)+' MB/s',
       '最终前 N: '+(s.limit_maxlines? s.limit_maxlines : '不限制'),
       '因配额跳过: '+(s.skipped_quota??0),
       '配额后行数: '+(s.total_after_quota??'—'),
-      '最终返回行数: '+(j.count??'—')+(j.truncated?'（预览截断）':'')
-    ].join('\\n');
-    $('previewBox').textContent = box; openM($('previewModal'));
+      '最终返回行数: '+(j.count??'—')+(j.truncated?'（预览截断）':''),
+      '保存模式: '+(currentSaveMode==='overwrite'?'覆盖保存':'追加保存')
+    ];
+
+    $('previewBox').textContent = box.join('\\n'); openM($('previewModal'));
   };
 
   upload.onclick=async function(){
     if(!last || !last.lines || !last.lines.length){ toast('请先生成预览','error'); return; }
     if(!token.value){ toast('请填写验证 Token','error'); $('token').focus(); return; }
     try{
-      const res=await fetch('/api/publish?token='+encodeURIComponent(token.value),{method:'POST',headers:{'content-type':'text/plain; charset=utf-8'},body:last.lines.join('\\n')});
+      const res=await fetch('/api/publish?token='+encodeURIComponent(token.value),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({content:last.lines.join('\\n'), saveMode: currentSaveMode})});
       const j=await res.json(); if(!j.ok) throw new Error(j.error||'发布失败');
-      toast('已上传','success');
+      toast('已'+(currentSaveMode==='overwrite'?'覆盖':'追加')+'上传','success');
     }catch(e){ toast('上传失败：'+(e&&e.message?e.message:e),'error'); }
   };
 
