@@ -1,11 +1,12 @@
 // worker.js
-// YouXuan-API — Cloudflare Worker (2025-10-29 r9)
+// YouXuan-API — Cloudflare Worker (2025-10-29 r9 + speedMode patch r10)
 // - Glass UI, server-side bg/logo prefs (cross-device) via KV /api/prefs
 // - Quotas in own modal with help; latency-first sort with country grouping
 // - Region naming via Intl.DisplayNames zh-CN (fallback map + A2)
 // - Domain remark only for domains; IP needs port (gate)
 // - 3 region modes: country | city | country_city
 // - Safer IPv6 check (no giant regex)
+// - Added: speedMode (0=off,1=number,2=number+MB/s) and robust unit conversion to MB/s
 
 const REPO = "https://github.com/Yanson0219/YouXuan-API";
 
@@ -101,8 +102,8 @@ export default {
         const decorateFlg  = form.get("decorateFlag") === "on";
         const nodePrefix   = (form.get("nodePrefix") || "").toString();
         const nodeSuffix   = (form.get("nodeSuffix") || "").toString();
-        const appendUnit   = form.get("appendUnit") === "on";
         const digits       = clampInt(toPosInt(form.get("digits"), 2), 0, 6);
+        const speedMode    = clampInt(toPosInt(form.get("speedMode"), 2), 0, 2); // 0=off,1=number,2=number+unit
 
         const quotaV4      = toPosInt(form.get("quotaV4"), 0);
         const quotaV6      = toPosInt(form.get("quotaV6"), 0);
@@ -204,7 +205,7 @@ export default {
           const label = formatRegion3({ a2, sub, cityZh, raw:(regRaw||"") }, regionLang, regionDetail);
 
           // speed / latency
-          const spStr = formatSpeedRaw(col(speedIdx), appendUnit, digits);
+          const spStr = formatSpeedRaw(col(speedIdx), speedMode, digits); // <<< patched
           if (spStr) stats.with_speed_count++;
 
           let lat = Number.POSITIVE_INFINITY;
@@ -500,16 +501,51 @@ function isIPv6(v){
   return true;
 }
 
-function formatSpeedRaw(raw, appendUnit, digits){
+// Convert any speed string to MB/s number (decimal MB), or NaN if not parseable
+function parseSpeedToMBps(raw){
+  if (!raw) return NaN;
+  const o = String(raw).trim();
+  if (!o) return NaN;
+  const numMatch = o.replace(/,/g,'').match(/-?\d+(?:\.\d+)?/);
+  if (!numMatch) return NaN;
+  const val = parseFloat(numMatch[0]);
+  if (!Number.isFinite(val)) return NaN;
+
+  const lc = o.toLowerCase().replace(/\s+/g,'');
+
+  // Binary bytes first (KiB/MiB/GiB/TiB per second)
+  if (/tib(?:\/s|ps)?/.test(lc)) return (val * Math.pow(1024,4)) / 1e6;
+  if (/gib(?:\/s|ps)?/.test(lc)) return (val * Math.pow(1024,3)) / 1e6;
+  if (/mib(?:\/s|ps)?/.test(lc)) return (val * Math.pow(1024,2)) / 1e6;
+  if (/kib(?:\/s|ps)?/.test(lc)) return (val * 1024) / 1e6;
+
+  // Decimal BYTES with uppercase B (kB/MB/GB/TB per second)
+  if (/tb(?:\/s|ps)?/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e12) / 1e6; // TB/s
+  if (/gb(?:\/s|ps)?/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e9) / 1e6;  // GB/s
+  if (/mb(?:\/s|ps)?/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e6) / 1e6;  // MB/s
+  if (/kb(?:\/s|ps)?/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e3) / 1e6;  // kB/s
+
+  // Decimal BITS (kb/s, kbps, Mb/s, Mbps, Gb/s, Gbps...)
+  if (/(?:tbps|tbit\/s|tb\/s)/.test(lc)) return (val * 1e12) / 8 / 1e6;
+  if (/(?:gbps|gbit\/s|gb\/s)/.test(lc)) return (val * 1e9) / 8 / 1e6;
+  if (/(?:mbps|mbit\/s|mb\/s)/.test(lc)) return (val * 1e6) / 8 / 1e6;
+  if (/(?:kbps|kbit\/s|kb\/s)/.test(lc)) return (val * 1e3) / 8 / 1e6;
+
+  // Fallback: treat bare number as already MB/s
+  return val;
+}
+
+// speedMode: 0=off,1=number,2=number+MB/s
+function formatSpeedRaw(raw, speedMode, digits){
+  if (speedMode===0) return ""; // off
   raw = String(raw||"").trim();
   if (!raw) return "";
-  const m = raw.match(/-?\d+(?:\.\d+)?/);
-  if (!m) return "";
-  let val = parseFloat(m[0]); if (!Number.isFinite(val)) return "";
-  const body = (digits===0) ? String(Math.round(val)) : Number(val).toFixed(digits);
-  const hasUnit = /[a-zA-Z\/]/.test(raw);
-  if (hasUnit) return raw.replace(m[0], body).replace(/mb\s*\/\s*s/i,"MB/s");
-  return appendUnit ? (body + "MB/s") : body;
+  let valMB = parseSpeedToMBps(raw);
+  if (!Number.isFinite(valMB)) return "";
+
+  const body = (digits===0) ? String(Math.round(valMB)) : Number(valMB).toFixed(digits);
+  if (speedMode===1) return body;
+  return body + "MB/s"; // mode 2
 }
 
 /* ---------------- UI (HTML) ---------------- */
@@ -709,10 +745,18 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
       <div class="row">
         <div>
           <label>速度显示</label>
-          <label class="muted"><input type="checkbox" id="appendUnit" checked/> 无单位时追加 "MB/s"</label>
-          <label class="muted">保留小数位：
-            <select id="digits"><option value="2" selected>2</option><option value="0">0</option></select>
-          </label>
+          <div class="row">
+            <select id="speedMode">
+              <option value="0">不显示</option>
+              <option value="1">仅数字</option>
+              <option value="2" selected>数字+单位（MB/s）</option>
+            </select>
+            <select id="digits">
+              <option value="2" selected>保留 2 位小数</option>
+              <option value="0">保留 0 位小数</option>
+            </select>
+          </div>
+          <small class="help">自动识别并换算 kb/s、kbps、Mb/s、Mbps、KiB/s 等到 MB/s；选择“0 不显示”则完全不拼接速度。</small>
         </div>
         <div>
           <label>输出端口（仅对 IP 生效；域名不带端口）</label>
@@ -896,7 +940,7 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
 
   // Persisted settings
   const nodePrefix=$('nodePrefix'), nodeSuffix=$('nodeSuffix'), decorateFlag=$('decorateFlag');
-  const appendUnit=$('appendUnit'), digits=$('digits');
+  const digits=$('digits'), speedMode=$('speedMode');
   const quotaV4=$('quotaV4'), quotaV6=$('quotaV6'), maxLines=$('maxLines'), quotaPerTop=$('quotaPerTop'), quotaTopN=$('quotaTopN'), preferLowLat=$('preferLowLat');
   const regionLang=$('regionLang'), regionDetail=$('regionDetail');
   const token=$('token');
@@ -907,7 +951,10 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
   function save(k,v){ localStorage.setItem(LS+k, v); }
 
   nodePrefix.value = load('nodePrefix','');   nodeSuffix.value = load('nodeSuffix','');
-  appendUnit.checked = load('appendUnit','1')!=='0';  digits.value = load('digits','2');
+
+  // speedMode & digits
+  speedMode.value = load('speedMode','2');
+  digits.value = load('digits','2');
 
   quotaV4.value = load('quotaV4','0');  quotaV6.value = load('quotaV6','0');
   quotaPerTop.value = load('quotaPerTop','0'); quotaTopN.value = load('quotaTopN','0'); maxLines.value = load('maxLines','0');
@@ -921,7 +968,9 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
 
   ['input','change'].forEach(ev=>{
     nodePrefix.addEventListener(ev,()=>save('nodePrefix',nodePrefix.value||''));   nodeSuffix.addEventListener(ev,()=>save('nodeSuffix',nodeSuffix.value||''));
-    appendUnit.addEventListener(ev,()=>save('appendUnit',appendUnit.checked?'1':'0'));  digits.addEventListener(ev,()=>save('digits',digits.value||'2'));
+    digits.addEventListener(ev,()=>save('digits',digits.value||'2'));
+    speedMode.addEventListener(ev,()=>save('speedMode',speedMode.value||'2'));
+
     quotaV4.addEventListener(ev,()=>save('quotaV4',quotaV4.value||'0'));  quotaV6.addEventListener(ev,()=>save('quotaV6',quotaV6.value||'0'));
     quotaPerTop.addEventListener(ev,()=>save('quotaPerTop',quotaPerTop.value||'0')); quotaTopN.addEventListener(ev,()=>save('quotaTopN',quotaTopN.value||'0')); maxLines.addEventListener(ev,()=>save('maxLines',maxLines.value||'0'));
     preferLowLat.addEventListener(ev,()=>save('preferLowLat',preferLowLat.checked?'1':'0'));
@@ -955,7 +1004,8 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.18)}
 
       // advanced
       fd.append('nodePrefix',nodePrefix.value||''); fd.append('nodeSuffix',nodeSuffix.value||'');
-      if(appendUnit.checked) fd.append('appendUnit','on'); fd.append('digits',digits.value||'2');
+      fd.append('digits',digits.value||'2');
+      fd.append('speedMode',speedMode.value||'2'); // <<< patched
       fd.append('regionLang',regionLang.value||'zh'); fd.append('regionDetail',regionDetail.value||'country');
       if(decorateFlag.checked) fd.append('decorateFlag','on');
       fd.append('outPortSel',outPortSel.value||''); fd.append('outPortCus',outPortCus.value||'');
