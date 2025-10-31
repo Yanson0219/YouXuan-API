@@ -1077,6 +1077,21 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
             <button class="btn secondary" id="clearSubscription">🗑 清空内容</button>
             <button class="btn secondary" id="downloadSubscription">📤 下载订阅</button>
           </div>
+          
+          <!-- 添加IP删除功能 -->
+          <div style="margin-top:15px;padding:15px;background:var(--pill);border-radius:12px;">
+            <label style="font-weight:bold;color:var(--primary);">🗑️ 批量删除IP</label>
+            <div style="display:flex;gap:8px;margin-top:8px;">
+              <textarea id="deleteIpInput" placeholder="输入要删除的IP地址，每行一个或多个用空格/逗号分隔" 
+                       style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--card);min-height:80px;resize:vertical;"></textarea>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:8px;">
+              <button class="btn secondary" id="deleteIpBtn" style="white-space:nowrap;">删除所有指定IP</button>
+              <button class="btn secondary" id="clearIpInput" style="white-space:nowrap;">清空输入</button>
+            </div>
+            <small class="help">支持多种格式：每行一个IP，或用空格/逗号分隔多个IP。示例：<br>192.168.1.1<br>192.168.1.2 192.168.1.3<br>192.168.1.4,192.168.1.5</small>
+            <div id="deleteResult" style="margin-top:8px;font-size:12px;min-height:20px;"></div>
+          </div>
         </div>
       </div>
       <div class="row">
@@ -1352,6 +1367,146 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
     URL.revokeObjectURL(url);
     toast('订阅已下载','success');
   };
+
+  // IP删除功能 - 增强版，支持批量删除
+  $('deleteIpBtn').onclick = function() {
+    const inputText = $('deleteIpInput').value.trim();
+    const content = $('editContent').value;
+    
+    if (!inputText) {
+      showDeleteResult('请输入要删除的IP地址', 'error');
+      return;
+    }
+    
+    if (!content) {
+      showDeleteResult('订阅内容为空', 'error');
+      return;
+    }
+    
+    try {
+      // 解析多种输入格式：每行一个IP，或用空格/逗号分隔
+      const ipArray = parseIpInput(inputText);
+      
+      if (ipArray.length === 0) {
+        showDeleteResult('没有检测到有效的IP地址', 'error');
+        return;
+      }
+      
+      // 验证IP格式
+      const invalidIPs = ipArray.filter(ip => !isValidIPv4(ip));
+      if (invalidIPs.length > 0) {
+        showDeleteResult('以下IP地址格式不正确：' + invalidIPs.join(', '), 'error');
+        return;
+      }
+      
+      // 删除包含指定IP的行
+      const lines = content.split('\\n');
+      const newLines = [];
+      let deletedCount = 0;
+      const deletedIps = new Set();
+      
+      for (const line of lines) {
+        if (line.trim()) {
+          let shouldDelete = false;
+          let matchedIp = '';
+          
+          // 检查该行是否包含任意一个要删除的IP
+          for (const ip of ipArray) {
+            const ipRegex = new RegExp(\`\\\\b\${ip.replace(/\\./g, '\\\\.')}\\\\b\`);
+            if (ipRegex.test(line)) {
+              shouldDelete = true;
+              matchedIp = ip;
+              break;
+            }
+          }
+          
+          if (!shouldDelete) {
+            newLines.push(line);
+          } else {
+            deletedCount++;
+            deletedIps.add(matchedIp);
+          }
+        }
+      }
+      
+      const newContent = newLines.join('\\n');
+      $('editContent').value = newContent;
+      
+      if (deletedCount > 0) {
+        const deletedIpList = Array.from(deletedIps).join(', ');
+        showDeleteResult(\`成功删除 \${deletedCount} 行，涉及IP：\${deletedIpList}\`, 'success');
+      } else {
+        showDeleteResult(\`未找到包含以下IP的行：\${ipArray.join(', ')}\`, 'warning');
+      }
+      
+    } catch (e) {
+      showDeleteResult('删除失败: ' + (e && e.message ? e.message : e), 'error');
+    }
+  };
+
+  // 解析IP输入，支持多种格式
+  function parseIpInput(inputText) {
+    const lines = inputText.split('\\n');
+    const ipArray = [];
+    
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
+      
+      // 支持空格分隔的多个IP
+      if (trimmedLine.includes(' ') || trimmedLine.includes(',')) {
+        const ips = trimmedLine.split(/[\\s,]+/);
+        for (const ip of ips) {
+          const trimmedIp = ip.trim();
+          if (trimmedIp && isValidIPv4(trimmedIp)) {
+            ipArray.push(trimmedIp);
+          }
+        }
+      } else {
+        // 单行单个IP
+        if (isValidIPv4(trimmedLine)) {
+          ipArray.push(trimmedLine);
+        }
+      }
+    }
+    
+    return [...new Set(ipArray)]; // 去重
+  }
+
+  // IPv4验证函数
+  function isValidIPv4(ip) {
+    const ipPattern = /^(\\d{1,3}\\.){3}\\d{1,3}$/;
+    if (!ipPattern.test(ip)) return false;
+    
+    // 验证每个数字在0-255范围内
+    const parts = ip.split('.');
+    for (const part of parts) {
+      const num = parseInt(part, 10);
+      if (num < 0 || num > 255) return false;
+    }
+    
+    return true;
+  }
+
+  // 清空IP输入
+  $('clearIpInput').onclick = function() {
+    $('deleteIpInput').value = '';
+    $('deleteResult').textContent = '';
+  };
+
+  // 显示删除结果的辅助函数
+  function showDeleteResult(message, type) {
+    const resultDiv = $('deleteResult');
+    resultDiv.textContent = message;
+    resultDiv.style.color = type === 'success' ? '#10b981' : 
+                           type === 'warning' ? '#f59e0b' : 
+                           '#ef4444';
+  }
+
+  // 清空删除结果
+  $('deleteIpInput').addEventListener('input', function() {
+    $('deleteResult').textContent = '';
+  });
 
   // progress + actions
   var go=$('go'), upload=$('upload'), copy=$('copy'), statsBtn=$('statsBtn');
