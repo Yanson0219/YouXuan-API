@@ -1,5 +1,5 @@
 // worker.js
-// YouXuan-API — Cloudflare Worker (修正版)
+// YouXuan-API — Cloudflare Worker (优化版)
 
 const REPO = "https://github.com/Yanson0219/YouXuan-API";
 
@@ -200,19 +200,20 @@ export default {
           const label = formatRegion3({ a2, sub, cityZh, raw:(regRaw||"") }, regionLang, regionDetail);
 
           // speed / latency
-          const spStr = formatSpeedRaw(col(speedIdx), speedMode, digits);
           const speedMB = parseSpeedToMBps(col(speedIdx)); // 获取速度数值用于过滤
+          
+          // 关键改进：只有当有有效速度值时才进行速度过滤
+          if (minSpeed > 0 && Number.isFinite(speedMB) && speedMB < minSpeed) {
+            stats.skipped_speed++;
+            continue;
+          }
+
+          const spStr = formatSpeedRaw(col(speedIdx), speedMode, digits);
           if (spStr) stats.with_speed_count++;
 
           let lat = Number.POSITIVE_INFINITY;
           if (latIdx>=0) {
             const m = col(latIdx).match(/-?\d+(?:\.\d+)?/); if (m) { const v=parseFloat(m[0]); if (Number.isFinite(v)) lat=v; }
-          }
-
-          // 速度过滤
-          if (minSpeed > 0 && (!Number.isFinite(speedMB) || speedMB < minSpeed)) {
-            stats.skipped_speed++;
-            continue;
           }
 
           // counts
@@ -250,7 +251,7 @@ export default {
             host: host,
             port: finalPort,
             line: addrDisp + "#" + remark,
-            speedMB // 保存速度数值用于后续处理
+            speedMB: Number.isFinite(speedMB) ? speedMB : 0 // 确保有数值
           });
         }
 
@@ -312,10 +313,10 @@ export default {
         });
       }
 
-      // publish - 修正版，直接处理纯节点数据
-      if (request.method === "POST" && path === "/api/publish") {
-        if (!env.KV)    return J({ ok:false, error:"KV not bound" }, 500);
-        if (!env.TOKEN) return J({ ok:false, error:"TOKEN not configured" }, 500);
+      // publish - 改进版
+      if (request.method === 'POST' && path === '/api/publish') {
+        if (!env.KV) return J({ ok: false, error: "KV not bound" }, 500);
+        if (!env.TOKEN) return J({ ok: false, error: "TOKEN not configured" }, 500);
 
         const q = new URL(request.url).searchParams;
         let token = q.get("token") || request.headers.get("x-token");
@@ -323,57 +324,80 @@ export default {
         let content = "";
         let saveMode = "overwrite";
 
-        // 处理 JSON 格式的请求
+        // 处理不同内容类型
         if (ct.includes("application/json")) {
-          try { 
+          try {
             const jsonData = await request.json();
             token = (jsonData.token || token || "").toString();
             content = (jsonData.content || "").toString();
             saveMode = (jsonData.saveMode || "overwrite").toString();
           } catch(e) {
-            return J({ ok:false, error:"Invalid JSON format" }, 400);
+            return J({ ok: false, error: "Invalid JSON format" }, 400);
           }
-        }
-        // 处理 multipart/form-data 格式的请求
-        else if (ct.includes("multipart/form-data")) {
+        } else if (ct.includes("multipart/form-data")) {
           const formData = await request.formData();
           token = (formData.get("token") || token || "").toString();
           content = (formData.get("content") || "").toString();
           saveMode = (formData.get("saveMode") || "overwrite").toString();
-        }
-        // 处理纯文本格式的请求
-        else {
+        } else {
+          // 纯文本处理
           content = await request.text();
-          // 清理 multipart 格式，提取纯节点数据
-          content = cleanMultipartContent(content);
+          // 尝试解析可能包含的保存模式
+          const lines = content.split('\n');
+          const lastLine = lines[lines.length - 1];
+          if (lastLine.includes('saveMode=')) {
+            saveMode = lastLine.split('saveMode=')[1].trim();
+            content = lines.slice(0, -1).join('\n');
+          }
         }
 
-        if (token !== env.TOKEN) return J({ ok:false, error:"Unauthorized (bad token)" }, 401);
+        if (token !== env.TOKEN) return J({ ok: false, error: "Unauthorized (bad token)" }, 401);
         
-        // 最终清理内容（确保没有格式边界）
-        if (content.includes("------WebKitFormBoundary")) {
-          content = cleanMultipartContent(content);
-        }
-        
-        if (!content) return J({ ok:false, error:"content is empty" }, 400);
+        content = content.trim();
+        if (!content) return J({ ok: false, error: "content is empty" }, 400);
 
         const key = env.TOKEN;
-        // 确保内容是一行一个，格式正确
+        
+        // 清理内容，确保格式正确
         content = content.split("\n")
           .map(line => line.trim())
-          .filter(line => line && !line.includes("Content-Disposition") && !line.includes("WebKitFormBoundary"))
+          .filter(line => {
+            // 保留有效的节点行
+            return line && 
+                   !line.includes("Content-Disposition") && 
+                   !line.includes("WebKitFormBoundary") &&
+                   !line.includes("saveMode") &&
+                   !line.includes("token") &&
+                   line !== "overwrite" &&
+                   line !== "append" &&
+                   line !== "--";
+          })
           .join("\n");
-        
+
         // 处理保存模式
+        let finalContent = content;
         if (saveMode === "append") {
           const existing = await env.KV.get("sub:" + key) || "";
-          content = existing + (existing ? "\n" : "") + content;
+          finalContent = existing + (existing ? "\n" : "") + content;
         }
 
-        await env.KV.put("sub:" + key, content);
-        const meta = { updated: Date.now(), count: content ? content.split("\n").length : 0, saveMode };
+        await env.KV.put("sub:" + key, finalContent);
+        const meta = { 
+          updated: Date.now(), 
+          count: finalContent ? finalContent.split("\n").filter(l => l.trim()).length : 0, 
+          saveMode,
+          lines: finalContent.split("\n").slice(0, 10) // 保存前10行用于预览
+        };
         await env.KV.put("meta:" + key, JSON.stringify(meta));
-        return J({ ok:true, key, count: meta.count, updated: meta.updated, saveMode });
+        
+        return J({ 
+          ok: true, 
+          key, 
+          count: meta.count, 
+          updated: meta.updated, 
+          saveMode,
+          preview: meta.lines
+        });
       }
 
       return new Response("Not Found", { status: 404 });
@@ -460,7 +484,7 @@ const COUNTRY_ZH = {
   AT:"奥地利", CZ:"捷克", HU:"匈牙利", UA:"乌克兰", IL:"以色列", SA:"沙特阿拉伯", EG:"埃及", NG:"尼日利亚", CL:"智利", CO:"哥伦比亚",
   AR:"阿根廷", PE:"秘鲁", NZ:"新西兰", MY:"马来西亚", ID:"印度尼西亚", VN:"越南", PH:"菲律宾", BD:"孟加拉国", PK:"巴基斯坦",
   LK:"斯里兰卡", NP:"尼泊尔", MM:"缅甸", KH:"柬埔寨", LA:"老挝", BN:"文莱", AF:"阿富汗", IQ:"伊拉克", IR:"伊朗", SY:"叙利亚",
-  JO:"约旦", LB:"黎巴嫩", OM:"阿曼", YE:"也门", QA:"卡塔尔", KW:"科威特", BH:"巴林", CY:"塞浦路斯", MT:"马耳他",
+  JO:"约旦", LB:"黎巴嫩", OM:"阿曼", YE:"也门", QA:"卡塔尔", KW:"科威特", BH:"巴林", CYP:"塞浦路斯", MT:"马耳他",
   IS:"冰岛", EE:"爱沙尼亚", LV:"拉脱维亚", LT:"立陶宛", BY:"白俄罗斯", MD:"摩尔多瓦", GE:"格鲁吉亚", AM:"亚美尼亚", AZ:"阿塞拜疆",
   KZ:"哈萨克斯坦", UZ:"乌兹别克斯坦", TM:"土库曼斯坦", KG:"吉尔吉斯斯坦", TJ:"塔吉克斯坦", MN:"蒙古", KP:"朝鲜", UY:"乌拉圭",
   PY:"巴拉圭", BO:"玻利维亚", EC:"厄瓜多尔", VE:"委内瑞拉", CR:"哥斯达黎加", PA:"巴拿马", CU:"古巴", DO:"多米尼加", JM:"牙买加",
@@ -619,32 +643,35 @@ function parseSpeedToMBps(raw){
   if (!raw) return NaN;
   const o = String(raw).trim();
   if (!o) return NaN;
-  const numMatch = o.replace(/,/g,'').match(/-?\d+(?:\.\d+)?/);
+  
+  // 首先尝试直接提取数字（包括科学计数法）
+  const numMatch = o.replace(/,/g, '').match(/-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/i);
   if (!numMatch) return NaN;
-  const val = parseFloat(numMatch[0]);
+  
+  let val = parseFloat(numMatch[0]);
   if (!Number.isFinite(val)) return NaN;
 
-  const lc = o.toLowerCase().replace(/\s+/g,'');
+  const lc = o.toLowerCase().replace(/\s+/g, '');
 
-  // Binary bytes first (KiB/MiB/GiB/TiB per second)
-  if (/tib(?:\/s|ps)?/.test(lc)) return (val * Math.pow(1024,4)) / 1e6;
-  if (/gib(?:\/s|ps)?/.test(lc)) return (val * Math.pow(1024,3)) / 1e6;
-  if (/mib(?:\/s|ps)?/.test(lc)) return (val * Math.pow(1024,2)) / 1e6;
-  if (/kib(?:\/s|ps)?/.test(lc)) return (val * 1024) / 1e6;
-
-  // Decimal BYTES with uppercase B (kB/MB/GB/TB per second)
-  if (/tb(?:\/s|ps)?/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e12) / 1e6; // TB/s
-  if (/gb(?:\/s|ps)?/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e9) / 1e6;  // GB/s
-  if (/mb(?:\/s|ps)?/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e6) / 1e6;  // MB/s
-  if (/kb(?:\/s|ps)?/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e3) / 1e6;  // kB/s
-
-  // Decimal BITS (kb/s, kbps, Mb/s, Mbps, Gb/s, Gbps...)
+  // 处理各种速度单位
+  if (/(?:tib(?:\/s|ps)?)/.test(lc)) return (val * Math.pow(1024, 4)) / 1e6;
+  if (/(?:gib(?:\/s|ps)?)/.test(lc)) return (val * Math.pow(1024, 3)) / 1e6;
+  if (/(?:mib(?:\/s|ps)?)/.test(lc)) return (val * Math.pow(1024, 2)) / 1e6;
+  if (/(?:kib(?:\/s|ps)?)/.test(lc)) return (val * 1024) / 1e6;
+  
+  // 处理字节单位 (B, KB, MB, GB)
+  if (/(?:tb(?:\/s|ps)?)/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e12) / 1e6;
+  if (/(?:gb(?:\/s|ps)?)/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e9) / 1e6;
+  if (/(?:mb(?:\/s|ps)?)/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e6) / 1e6;
+  if (/(?:kb(?:\/s|ps)?)/.test(lc) && /b(?!it)/.test(lc)) return (val * 1e3) / 1e6;
+  
+  // 处理比特单位 (bps, kbps, Mbps, Gbps)
   if (/(?:tbps|tbit\/s|tb\/s)/.test(lc)) return (val * 1e12) / 8 / 1e6;
   if (/(?:gbps|gbit\/s|gb\/s)/.test(lc)) return (val * 1e9) / 8 / 1e6;
   if (/(?:mbps|mbit\/s|mb\/s)/.test(lc)) return (val * 1e6) / 8 / 1e6;
   if (/(?:kbps|kbit\/s|kb\/s)/.test(lc)) return (val * 1e3) / 8 / 1e6;
-
-  // Fallback: treat bare number as already MB/s
+  
+  // 默认：假设已经是 MB/s
   return val;
 }
 
@@ -653,11 +680,22 @@ function formatSpeedRaw(raw, speedMode, digits){
   if (speedMode===0) return ""; // off
   raw = String(raw||"").trim();
   if (!raw) return "";
+  
   let valMB = parseSpeedToMBps(raw);
-  if (!Number.isFinite(valMB)) return "";
-
-  const body = (digits===0) ? String(Math.round(valMB)) : Number(valMB).toFixed(digits);
-  if (speedMode===1) return body;
+  if (!Number.isFinite(valMB) || valMB <= 0) return "";
+  
+  // 确保数字格式正确
+  let body;
+  if (digits === 0) {
+    body = String(Math.round(valMB));
+  } else {
+    body = Number(valMB).toFixed(digits);
+    // 去除不必要的 .00
+    if (body.endsWith('.00')) body = body.slice(0, -3);
+    else if (body.endsWith('0') && body.includes('.')) body = body.slice(0, -1);
+  }
+  
+  if (speedMode === 1) return body;
   return body + "MB/s"; // mode 2
 }
 
@@ -676,7 +714,7 @@ function cleanMultipartContent(rawContent) {
       if (line.includes("saveMode")) return false;
       if (line.includes("token")) return false;
       if (line === "overwrite") return false;
-      if (line === "yuu") return false;
+      if (line === "append") return false;
       if (line === "--") return false;
       // 只保留 IP:端口#地区的格式
       return line.match(/^[\d\.:\[\]]+#/) || line.match(/^[^#]+#\S+$/);
@@ -762,23 +800,9 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
 .save-mode{display:flex;gap:10px;margin:10px 0;}
 .save-mode-btn{flex:1;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--text);cursor:pointer;text-align:center;transition:all 0.2s ease;}
 .save-mode-btn.active{background:linear-gradient(90deg,var(--primary),var(--accent));color:#fff;border-color:var(--primary);}
-/* latency results */
-.latency-results{margin-top:10px;max-height:300px;overflow-y:auto;}
-.latency-item{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-radius:8px;margin-bottom:5px;background:var(--pill);}
-.latency-success{background:rgba(16,185,129,0.1);border-left:4px solid #10b981;}
-.latency-failed{background:rgba(239,68,68,0.1);border-left:4px solid #ef4444;}
-.latency-value{font-weight:bold;}
-.latency-value.good{color:#10b981;}
-.latency-value.medium{color:#f59e0b;}
-.latency-value.poor{color:#ef4444;}
-.latency-progress{width:100%;height:6px;background:var(--border);border-radius:3px;margin-top:5px;overflow:hidden;}
-.latency-progress-bar{height:100%;background:linear-gradient(90deg,var(--primary),var(--accent));transition:width 0.3s ease;}
-.testing-info{background:rgba(59,130,246,0.1);border-left:4px solid var(--primary);padding:10px;border-radius:8px;margin:10px 0;}
-/* output area with test buttons */
-.output-line{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border);}
-.output-line:last-child{border-bottom:none;}
-.output-text{flex:1;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;}
-.output-actions{display:flex;gap:5px;margin-left:10px;}
+/* progress bar */
+.progress-container{width:100%;background:var(--border);border-radius:10px;overflow:hidden;margin:10px 0;}
+.progress-bar{height:20px;background:linear-gradient(90deg,var(--primary),var(--accent));border-radius:10px;transition:width 0.3s ease;display:flex;align-items:center;justify-content:center;color:white;font-size:12px;font-weight:bold;}
 </style>
 </head>
 <body>
@@ -794,6 +818,7 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
           <div class="pill" id="kvPill"><span id="kvDot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#9ca3af"></span>&nbsp;<span id="kvText">KV 未绑定</span></div>
           <button class="pill" id="themeBtn" type="button">🌙 深色</button>
           <a class="pill" href="${REPO}" target="_blank" style="color:var(--text)">GitHub</a>
+          <button class="pill" id="editBtn" type="button">✏️ 编辑订阅</button>
         </div>
       </div>
 
@@ -834,8 +859,6 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
               <button class="btn secondary" id="personalBtn" type="button">🎨 个性化设置</button>
               <button class="btn secondary" id="advBtn" type="button">⚙️ 高级设置</button>
               <button class="btn secondary" id="quotaBtn" type="button">🧮 配额与限制</button>
-              <button class="btn secondary" id="latencyBtn" type="button">📡 本地延迟测试</button>
-              <button class="btn secondary" id="testAllBtn" type="button">🧪 测试全部节点</button>
             </div>
             <div class="save-mode">
               <div class="save-mode-btn active" data-mode="overwrite">覆盖保存</div>
@@ -847,11 +870,10 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
 
       <div class="card pad" style="margin-top:14px">
         <div class="progress" id="progWrap" style="display:none"><div class="bar" id="bar" style="height:10px;background:linear-gradient(90deg,var(--primary),var(--accent));border-radius:999px;width:0%"></div></div>
-        <div id="outputContainer" style="max-height:400px;overflow-y:auto;margin-bottom:10px;">
-          <textarea id="out" class="mono" rows="18" placeholder="点击"生成预览"后在此显示结果" style="width:100%;border:none;background:transparent;resize:none;"></textarea>
+        <div id="outputContainer" style="margin-bottom:10px;">
+          <textarea id="out" class="mono" rows="18" placeholder="点击"生成预览"后在此显示结果" style="width:100%"></textarea>
         </div>
         <div id="miniStats" class="muted" style="margin-top:8px;line-height:1.8"></div>
-        <div id="latencyResults" class="latency-results"></div>
       </div>
     </div>
   </div>
@@ -968,7 +990,9 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
           </div>
           <small class="help">仅对优选域名生效（如 visa.cn）；IP 不套此规则。</small>
         </div>
-        <div></div>
+        <div>
+          <!-- 删除测速设置 -->
+        </div>
       </div>
 
       <div class="actions"><button class="btn secondary" id="closeAdv" type="button">关闭</button></div>
@@ -1034,37 +1058,37 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
     </div>
   </div>
 
-  <!-- 本地延迟测试 -->
-  <div class="modal" id="latencyModal">
+  <!-- 编辑订阅 -->
+  <div class="modal" id="editModal">
     <div class="panel">
-      <div class="title">本地延迟测试</div>
+      <div class="title">编辑订阅</div>
       <div class="testing-info">
-        <strong>测试说明：</strong> 此功能使用您本地浏览器网络真实连接测试服务器的延迟，反映您当前网络到各服务器的真实连接质量。
+        <strong>说明：</strong> 此功能需要输入正确的 TOKEN 才能编辑已保存的订阅内容。
       </div>
       <div class="row">
         <div>
-          <label>测试服务器</label>
-          <textarea id="latencyServers" rows="6" placeholder="输入要测试的服务器，每行一个，格式：IP:端口 或 域名:端口&#10;例如：&#10;183.236.51.220:7005&#10;visa.cn:443&#10;[2606:4700::1]:2053"></textarea>
-          <div style="margin-top:10px;">
-            <button class="btn secondary small" id="importFromPreview">从预览导入</button>
-            <button class="btn secondary small" id="clearLatencyList">清空列表</button>
-          </div>
+          <label>订阅 Token</label>
+          <input type="text" id="editToken" placeholder="输入订阅 TOKEN"/>
+          <button class="btn" id="loadSubscription" style="margin-top:10px;">📥 加载订阅</button>
         </div>
         <div>
-          <label>测试设置</label>
-          <input type="number" id="latencyTimeout" min="100" max="10000" value="400" placeholder="超时时间（毫秒）"/>
-          <input type="number" id="latencyThreshold" min="50" max="5000" value="300" placeholder="延迟阈值（毫秒）"/>
-          <input type="text" id="testUrl" placeholder="自定义测速地址（可选）" value="/"/>
-          <label class="muted"><input type="checkbox" id="latencyAutoFilter" checked/> 自动过滤高延迟节点</label>
-          <small class="help">测试完成后，自动过滤延迟高于此值的节点（默认300ms）</small>
+          <label>操作</label>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;">
+            <button class="btn secondary" id="clearSubscription">🗑 清空内容</button>
+            <button class="btn secondary" id="downloadSubscription">📤 下载订阅</button>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <div style="grid-column:1/-1">
+          <label>订阅内容</label>
+          <textarea id="editContent" rows="15" placeholder="订阅内容将在此显示" style="width:100%;font-family:ui-monospace,Menlo,Consolas,monospace;"></textarea>
         </div>
       </div>
       <div class="actions">
-        <button class="btn" id="startLatency" type="button">🚀 开始测试</button>
-        <button class="btn secondary" id="testAndUpload" type="button">📡 测试并上传</button>
-        <button class="btn secondary" id="closeLatency" type="button">关闭</button>
+        <button class="btn" id="saveSubscription">💾 保存订阅</button>
+        <button class="btn secondary" id="closeEdit" type="button">关闭</button>
       </div>
-      <div id="latencyResultsModal" class="latency-results" style="margin-top:20px;max-height:300px;"></div>
     </div>
   </div>
 
@@ -1246,396 +1270,98 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
   $('personalBtn').onclick=function(){ openM($('personalModal')); };
   $('advBtn').onclick=function(){ openM($('advModal')); };
   $('quotaBtn').onclick=function(){ openM($('quotaModal')); };
-  $('latencyBtn').onclick=function(){ openM($('latencyModal')); };
+  $('editBtn').onclick=function(){ openM($('editModal')); };
   $('closePersonal').onclick=function(){ closeM($('personalModal')); };
   $('closeAdv').onclick=function(){ closeM($('advModal')); };
   $('closeQuota').onclick=function(){ closeM($('quotaModal')); };
-  $('closeLatency').onclick=function(){ closeM($('latencyModal')); };
+  $('closeEdit').onclick=function(){ closeM($('editModal')); };
 
-  // Local Latency Test functionality
-  let latencyTestResults = [];
-  let currentPreviewLines = [];
-  
-  // 从预览导入到延迟测试
-  $('importFromPreview').onclick=function(){
-    if (currentPreviewLines.length === 0) {
-      toast('请先生成预览','error');
+  // 编辑订阅功能
+  $('loadSubscription').onclick=async function(){
+    const editToken = $('editToken').value.trim();
+    if (!editToken) {
+      toast('请输入订阅 TOKEN','error');
       return;
     }
     
-    const servers = currentPreviewLines.map(line => {
-      // 解析行格式：地址#备注
-      const [address, remark] = line.split('#');
-      return address;
-    }).filter(addr => addr);
-    
-    $('latencyServers').value = servers.join('\\n');
-    toast(\`已导入 \${servers.length} 个服务器到测试列表\`, 'success');
-  };
-  
-  // 清空延迟测试列表
-  $('clearLatencyList').onclick=function(){
-    $('latencyServers').value = '';
-    toast('已清空测试列表','success');
-  };
-  
-  // 本地延迟测试函数 - 放宽条件版本
-  async function testLocalLatency(server, timeout = 400, testPath = '/') {
-    return new Promise((resolve) => {
-      const start = Date.now();
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => {
-        controller.abort();
-        resolve({
-          ...server,
-          latency: timeout,
-          status: 'timeout',
-          success: false,
-          error: '请求超时'
-        });
-      }, timeout);
-      
-      const protocol = window.location.protocol === 'https:' ? 'https' : 'http';
-      const testUrl = \`\${protocol}://\${server.host}:\${server.port}\${testPath}\`;
-      
-      fetch(testUrl, {
-        method: 'HEAD',
-        mode: 'no-cors',
-        signal: controller.signal
-      })
-      .then(() => {
-        clearTimeout(timeoutId);
-        const latency = Date.now() - start;
-        // 放宽条件：只要有响应就认为是成功的
-        resolve({
-          ...server,
-          latency,
-          status: 'success',
-          success: true,
-          error: ''
-        });
-      })
-      .catch(error => {
-        clearTimeout(timeoutId);
-        const latency = Date.now() - start;
-        
-        // 放宽条件：只要在超时时间内有响应（即使出错），都认为是可用的
-        const success = latency < timeout;
-        
-        resolve({
-          ...server,
-          latency,
-          status: success ? 'success' : 'failed',
-          success: success,
-          error: success ? '连接可用（忽略协议错误）' : \`连接失败: \${error.message}\`
-        });
-      });
-    });
-  }
-  
-  // 批量本地延迟测试
-  async function batchLocalLatencyTest(servers, timeout = 400, testPath = '/', concurrency = 3) {
-    const results = [];
-    
-    for (let i = 0; i < servers.length; i += concurrency) {
-      const batch = servers.slice(i, i + concurrency);
-      const batchPromises = batch.map(server => testLocalLatency(server, timeout, testPath));
-      const batchResults = await Promise.all(batchPromises);
-      results.push(...batchResults);
-      
-      // 更新进度
-      const progress = ((i + batch.length) / servers.length * 100).toFixed(1);
-      $('latencyResultsModal').innerHTML = \`<div class="testing-info">测试进度: \${progress}% (\${i + batch.length}/\${servers.length})</div>\`;
-      
-      // 小延迟避免过于频繁
-      if (i + concurrency < servers.length) {
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
-    }
-    
-    return results;
-  }
-  
-  $('startLatency').onclick=async function(){
-    const serversText = $('latencyServers').value.trim();
-    if (!serversText) {
-      toast('请输入要测试的服务器','error');
-      return;
-    }
-
-    const servers = serversText.split('\\n')
-      .map(line => line.trim())
-      .filter(line => line)
-      .map(line => {
-        // 解析服务器格式
-        if (line.startsWith('[')) {
-          // IPv6 格式: [2606:4700::1]:2053
-          const ipv6Match = line.match(/\\[([^\\]]+)\\]:(\\d+)/);
-          if (ipv6Match) {
-            return { host: ipv6Match[1], port: parseInt(ipv6Match[2]), original: line };
-          }
-        } else if (line.includes(':')) {
-          // IPv4 或域名格式: 127.0.0.1:1234 或 visa.cn:443
-          const parts = line.split(':');
-          if (parts.length === 2) {
-            return { host: parts[0], port: parseInt(parts[1]), original: line };
-          }
-        } else {
-          // 没有端口，使用默认端口
-          return { host: line, port: 443, original: line };
-        }
-        return null;
-      })
-      .filter(server => server && server.host);
-
-    if (servers.length === 0) {
-      toast('没有有效的服务器格式','error');
-      return;
-    }
-
-    const timeout = parseInt($('latencyTimeout').value) || 400;
-    const testPath = $('testUrl').value || '/';
-
-    $('startLatency').disabled = true;
-    $('testAndUpload').disabled = true;
-    $('startLatency').textContent = '测试中...';
-    $('latencyResultsModal').innerHTML = '<div class="testing-info">正在使用本地网络测试 ' + servers.length + ' 个服务器的真实连接延迟...</div>';
-
     try {
-      const results = await batchLocalLatencyTest(servers, timeout, testPath, 3);
-      latencyTestResults = results;
+      const res = await fetch('/' + editToken + '.json');
+      if (!res.ok) throw new Error('加载失败');
       
-      // 显示结果
-      let html = '';
-      let successCount = 0;
-      let totalLatency = 0;
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || '加载失败');
       
-      results.forEach(server => {
-        const latencyClass = server.latency < 200 ? 'good' : server.latency < 500 ? 'medium' : 'poor';
-        const statusClass = server.success ? 'latency-success' : 'latency-failed';
-        
-        if (server.success) {
-          successCount++;
-          totalLatency += server.latency;
-        }
-        
-        html += \`
-          <div class="latency-item \${statusClass}">
-            <div>
-              <div>\${server.original}</div>
-              <div class="latency-progress">
-                <div class="latency-progress-bar" style="width: \${Math.min(server.latency / 1000 * 100, 100)}%"></div>
-              </div>
-            </div>
-            <div class="latency-value \${latencyClass}">\${server.latency}ms</div>
-            <div>\${server.success ? '✅' : '❌'}</div>
-          </div>
-        \`;
-      });
-
-      const avgLatency = successCount > 0 ? Math.round(totalLatency / successCount) : 0;
-      
-      html += \`<div style="margin-top:10px;font-weight:bold;text-align:center">成功率: \${successCount}/\${servers.length} (\${((successCount/servers.length)*100).toFixed(1)}%) | 平均延迟: \${avgLatency}ms</div>\`;
-      
-      $('latencyResultsModal').innerHTML = html;
-      
-      toast(\`测试完成: \${successCount}/\${servers.length} 个服务器可用，平均延迟 \${avgLatency}ms\`, 'success');
-      
-    } catch (error) {
-      toast('测试失败: ' + error.message, 'error');
-      $('latencyResultsModal').innerHTML = '<div style="color:#ef4444">测试失败: ' + error.message + '</div>';
-    } finally {
-      $('startLatency').disabled = false;
-      $('testAndUpload').disabled = false;
-      $('startLatency').textContent = '🚀 开始测试';
+      $('editContent').value = data.lines.join('\\n');
+      toast('订阅加载成功','success');
+    } catch(e) {
+      toast('加载失败: ' + (e && e.message ? e.message : e), 'error');
     }
   };
-
-  // 测试并上传功能 - 生成简洁格式
-  $('testAndUpload').onclick=async function(){
-    if (latencyTestResults.length === 0) {
-      toast('请先进行延迟测试','error');
+  
+  $('saveSubscription').onclick=async function(){
+    const editToken = $('editToken').value.trim();
+    const content = $('editContent').value.trim();
+    
+    if (!editToken) {
+      toast('请输入订阅 TOKEN','error');
       return;
     }
-
-    if(!token.value){ 
-      toast('请填写验证 Token','error'); 
-      $('token').focus(); 
-      return; 
-    }
-
-    const threshold = parseInt($('latencyThreshold').value) || 300;
-    const filteredResults = latencyTestResults.filter(server => 
-      server.success && server.latency <= threshold
-    );
-
-    if (filteredResults.length === 0) {
-      toast('没有符合条件的服务器','error');
+    
+    if (!content) {
+      toast('订阅内容不能为空','error');
       return;
     }
-
-    // 生成简洁格式的订阅内容
-    const subscriptionLines = filteredResults.map(server => {
-      const address = server.original.split('#')[0].trim();
-      return \`\${address}#香港\`; // 可以根据需要修改地区
-    });
-
-    const subscriptionContent = subscriptionLines.join('\\n');
-
-    // 使用FormData确保格式正确
-    const formData = new FormData();
-    formData.append('content', subscriptionContent);
-    formData.append('saveMode', currentSaveMode);
-    formData.append('token', token.value);
-
+    
     try {
-      const res = await fetch('/api/publish?token=' + encodeURIComponent(token.value), {
+      const res = await fetch('/api/publish?token=' + encodeURIComponent(editToken), {
         method: 'POST',
-        body: formData
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content, saveMode: 'overwrite' })
       });
       
       const j = await res.json(); 
-      if(!j.ok) throw new Error(j.error || '发布失败');
+      if(!j.ok) throw new Error(j.error||'保存失败');
       
-      toast('成功上传 ' + filteredResults.length + ' 个节点', 'success');
-      closeM($('latencyModal'));
-      
-    } catch(e) { 
-      toast('上传失败: ' + (e && e.message ? e.message : e), 'error'); 
+      toast('订阅保存成功','success');
+      closeM($('editModal'));
+    } catch(e) {
+      toast('保存失败: ' + (e && e.message ? e.message : e), 'error');
     }
   };
-
-  // 测试全部节点
-  $('testAllBtn').onclick=function(){
-    if (currentPreviewLines.length === 0) {
-      toast('请先生成预览','error');
+  
+  $('clearSubscription').onclick=function(){
+    $('editContent').value = '';
+    toast('内容已清空','success');
+  };
+  
+  $('downloadSubscription').onclick=function(){
+    const content = $('editContent').value;
+    if (!content) {
+      toast('没有内容可下载','error');
       return;
     }
     
-    const servers = currentPreviewLines.map(line => {
-      const [address] = line.split('#');
-      return address;
-    }).filter(addr => addr);
-    
-    $('latencyServers').value = servers.join('\\n');
-    openM($('latencyModal'));
-    toast(\`已导入 \${servers.length} 个节点到测试列表\`, 'success');
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'subscription.txt';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast('订阅已下载','success');
   };
-
-  // 更新输出区域显示，添加测试按钮
-  function updateOutputWithTestButtons(lines) {
-    currentPreviewLines = lines;
-    const container = $('outputContainer');
-    const textarea = $('out');
-    
-    // 清空容器
-    container.innerHTML = '';
-    
-    // 创建新的文本区域
-    const newTextarea = document.createElement('textarea');
-    newTextarea.id = 'out';
-    newTextarea.className = 'mono';
-    newTextarea.rows = 18;
-    newTextarea.placeholder = '点击"生成预览"后在此显示结果';
-    newTextarea.style.width = '100%';
-    newTextarea.style.border = 'none';
-    newTextarea.style.background = 'transparent';
-    newTextarea.style.resize = 'none';
-    newTextarea.value = lines.join('\\n');
-    
-    // 创建带按钮的显示区域
-    const linesContainer = document.createElement('div');
-    linesContainer.style.maxHeight = '400px';
-    linesContainer.style.overflowY = 'auto';
-    
-    lines.forEach((line, index) => {
-      const lineDiv = document.createElement('div');
-      lineDiv.className = 'output-line';
-      
-      const textSpan = document.createElement('span');
-      textSpan.className = 'output-text';
-      textSpan.textContent = line;
-      
-      const actionsDiv = document.createElement('div');
-      actionsDiv.className = 'output-actions';
-      
-      const testBtn = document.createElement('button');
-      testBtn.className = 'btn secondary small';
-      testBtn.textContent = '测试';
-      testBtn.title = '测试此节点延迟';
-      testBtn.onclick = () => {
-        $('latencyServers').value = line.split('#')[0];
-        openM($('latencyModal'));
-        toast('已添加到测试列表', 'success');
-      };
-      
-      actionsDiv.appendChild(testBtn);
-      lineDiv.appendChild(textSpan);
-      lineDiv.appendChild(actionsDiv);
-      linesContainer.appendChild(lineDiv);
-    });
-    
-    // 添加标签页切换
-    const tabContainer = document.createElement('div');
-    tabContainer.style.display = 'flex';
-    tabContainer.style.marginBottom = '10px';
-    tabContainer.style.borderBottom = '1px solid var(--border)';
-    
-    const textTab = document.createElement('button');
-    textTab.textContent = '纯文本视图';
-    textTab.style.padding = '8px 16px';
-    textTab.style.border = 'none';
-    textTab.style.background = 'transparent';
-    textTab.style.borderBottom = '2px solid var(--primary)';
-    textTab.style.cursor = 'pointer';
-    
-    const buttonTab = document.createElement('button');
-    buttonTab.textContent = '带测试按钮视图';
-    buttonTab.style.padding = '8px 16px';
-    buttonTab.style.border = 'none';
-    buttonTab.style.background = 'transparent';
-    buttonTab.style.cursor = 'pointer';
-    
-    let currentView = 'buttons';
-    
-    textTab.onclick = () => {
-      if (currentView === 'buttons') {
-        container.innerHTML = '';
-        container.appendChild(newTextarea);
-        textTab.style.borderBottom = '2px solid var(--primary)';
-        buttonTab.style.borderBottom = 'none';
-        currentView = 'text';
-      }
-    };
-    
-    buttonTab.onclick = () => {
-      if (currentView === 'text') {
-        container.innerHTML = '';
-        container.appendChild(tabContainer);
-        container.appendChild(linesContainer);
-        textTab.style.borderBottom = 'none';
-        buttonTab.style.borderBottom = '2px solid var(--primary)';
-        currentView = 'buttons';
-      }
-    };
-    
-    tabContainer.appendChild(textTab);
-    tabContainer.appendChild(buttonTab);
-    
-    // 默认显示带按钮的视图
-    container.appendChild(tabContainer);
-    container.appendChild(linesContainer);
-  }
 
   // progress + actions
   var go=$('go'), upload=$('upload'), copy=$('copy'), statsBtn=$('statsBtn');
-  var out=$('out'), progWrap=$('progWrap'), bar=$('bar'), mini=$('miniStats'), latencyResults=$('latencyResults');
+  var progWrap=$('progWrap'), bar=$('bar'), mini=$('miniStats');
   function showProg(){ progWrap.style.display='block'; bar.style.width='0%'; }
 
   var last=null;
   go.onclick=async function(){
     try{
-      go.disabled=true; out.value=''; mini.textContent=''; latencyResults.innerHTML=''; showProg(); await new Promise(r=>setTimeout(r,60));
+      go.disabled=true; mini.textContent=''; showProg(); await new Promise(r=>setTimeout(r,60));
 
       var fd=new FormData();
       (fileList||[]).forEach(f=>fd.append('files',f));
@@ -1662,8 +1388,7 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
       if(!j.ok) throw new Error(j.error||'未知错误');
       bar.style.width='100%'; 
       
-      // 使用新的带按钮的显示方式
-      updateOutputWithTestButtons(j.lines || []);
+      $('out').value = (j.lines||[]).join('\\n');
       last=j;
 
       const s=j.stats||{};
@@ -1687,12 +1412,12 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
 
   copy.onclick=async function(){
     try{ 
-      const outText = $('out').value;
+      const outText = document.getElementById('out').value;
       await navigator.clipboard.writeText(outText); 
       toast('已复制','success'); 
     } catch(_){ 
       try{ 
-        $('out').select(); 
+        document.getElementById('out').select(); 
         document.execCommand('copy'); 
         toast('已复制','success'); 
       } catch(e){ 
@@ -1727,12 +1452,21 @@ html[data-theme="dark"] .panel{border-color:rgba(148,163,184,.25)}
     $('previewBox').textContent = box.join('\\n'); openM($('previewModal'));
   };
 
+  // 上传功能
   upload.onclick=async function(){
     if(!last || !last.lines || !last.lines.length){ toast('请先生成预览','error'); return; }
     if(!token.value){ toast('请填写验证 Token','error'); $('token').focus(); return; }
+    
     try{
-      const res=await fetch('/api/publish?token='+encodeURIComponent(token.value),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({content:last.lines.join('\\n'), saveMode: currentSaveMode})});
-      const j=await res.json(); if(!j.ok) throw new Error(j.error||'发布失败');
+      const res=await fetch('/api/publish?token='+encodeURIComponent(token.value),{
+        method:'POST',
+        headers:{'content-type':'application/json'},
+        body:JSON.stringify({content: last.lines.join('\\n'), saveMode: currentSaveMode})
+      });
+      
+      const j=await res.json(); 
+      if(!j.ok) throw new Error(j.error||'发布失败');
+      
       toast('已'+(currentSaveMode==='overwrite'?'覆盖':'追加')+'上传','success');
     }catch(e){ toast('上传失败：'+(e&&e.message?e.message:e),'error'); }
   };
